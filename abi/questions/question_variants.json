@@ -1,0 +1,46 @@
+[
+  {
+    "question": "What is the average customer lifetime value for [time period/segment/location]?",
+    "variants": [
+      "What's the average CLV?",
+      "Show me customer lifetime value",
+      "Calculate average lifetime spend per customer"
+    ]
+  },
+  {
+    "question": "What is our customer retention rate at 30/60/90/180 days?",
+    "variants": [
+      "What's our retention rate?",
+      "How many customers come back within 90 days?",
+      "Calculate 6-month retention",
+      "What percentage of customers are retained at 180 days?"
+    ]
+  },
+  {
+    "question": "What is the distribution of customers by visit frequency (1, 2-5, 6-11, 12+ visits per year)?",
+    "variants": [
+      "How often do customers visit?",
+      "Show customer visit frequency",
+      "How many times do customers come in?"
+    ]
+  },
+  {
+    "question": "What is the total revenue for [location/time period]?",
+    "variants": [
+      "What was our revenue last month?",
+      "Show me total sales",
+      "How much money did we make?",
+      "What's our revenue by location?"
+    ]
+  },
+  {
+    "question": "How does [specific location] compare to the network average for [metric]?",
+    "variants": [
+      "How do we compare to the network?",
+      "Where do we rank for visit frequency?",
+      "Show me our percentile for CLV",
+      "Are we above or below average?",
+      "Compare our metrics to other locations"
+    ]
+  }
+]
