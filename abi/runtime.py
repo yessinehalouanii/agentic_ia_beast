@@ -1,18 +1,11 @@
 # abi/runtime.py
 
 import pandas as pd
-import numpy as np  # ✅ ADDED (for NaN/Inf cleanup)
+import numpy as np  # ✅ For NaN/Inf cleanup
 from typing import Any, Dict, Tuple
-from helpers.analytics_helpers import resolve_column  # only this at top
 
-# ✅ ADDED: import helper functions so exec() can access them
-from helpers.analytics_helpers import (
-    compute_customer_ltv,
-    compute_visit_frequency,
-    add_service_channel_visits,
-    build_customer_channel_map_from_visits,
-    merge_customer_channel_into_snapshot,
-)
+# Only this at top to avoid circular imports
+from helpers.analytics_helpers import resolve_column
 
 # Business timezone (Florida)
 BUSINESS_TZ = "America/New_York"
@@ -97,7 +90,7 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =====================================================================
-# ✅ ADDED: JSON-safe conversion helper (fixes NaN/Inf FastAPI 500)
+# ✅ JSON-safe conversion helper (fixes NaN/Inf FastAPI 500)
 # =====================================================================
 
 def to_json_safe(obj: Any) -> Any:
@@ -187,6 +180,7 @@ def runtime_normalize_mdf_env(env: dict[str, Any]) -> None:
         add_service_channel_visits,
         build_customer_channel_map_from_visits,
         merge_customer_channel_into_snapshot,
+        _expand_es_nested_columns,
     )
 
     pd_ = env["pd"]
@@ -196,8 +190,9 @@ def runtime_normalize_mdf_env(env: dict[str, Any]) -> None:
     norm_tables: dict[str, pd.DataFrame] = {}
     for name, df in tables_.items():
         if isinstance(df, pd_.DataFrame):
-            df2 = _clean_columns(df)     # flatten + dedupe columns
-            _normalize_dates_inplace(df2)
+            df2 = _clean_columns(df)         # flatten + dedupe columns
+            _normalize_dates_inplace(df2)    # normalize dates
+            df2 = _expand_es_nested_columns(df2)  # ✅ add customer_name, location_name, etc.
             norm_tables[name] = df2
         else:
             norm_tables[name] = df
@@ -305,6 +300,15 @@ def run_generated_code(code: str, tables: Dict[str, pd.DataFrame]) -> Tuple[pd.D
     if not code or not isinstance(code, str):
         return pd.DataFrame(), "No code to execute."
 
+    # 👇 Import helpers here so we can expose them to the exec env
+    from helpers.analytics_helpers import (
+        compute_customer_ltv,
+        compute_visit_frequency,
+        add_service_channel_visits,
+        build_customer_channel_map_from_visits,
+        merge_customer_channel_into_snapshot,
+    )
+
     env: Dict[str, Any] = {
         "pd": pd,
         "tables": tables or {},
@@ -313,14 +317,14 @@ def run_generated_code(code: str, tables: Dict[str, pd.DataFrame]) -> Tuple[pd.D
         "resolve_column": resolve_column,
         "runtime_normalize_mdf_env": runtime_normalize_mdf_env,
 
-        # ✅ ADDED: expose helper functions so generated code can call them
+        # ✅ Expose helper functions so generated code can call them
         "compute_customer_ltv": compute_customer_ltv,
         "compute_visit_frequency": compute_visit_frequency,
         "add_service_channel_visits": add_service_channel_visits,
         "build_customer_channel_map_from_visits": build_customer_channel_map_from_visits,
         "merge_customer_channel_into_snapshot": merge_customer_channel_into_snapshot,
 
-        # ✅ ADDED: expose JSON sanitizer for your API layer (optional but useful)
+        # ✅ Expose JSON sanitizer for your API layer
         "to_json_safe": to_json_safe,
     }
 

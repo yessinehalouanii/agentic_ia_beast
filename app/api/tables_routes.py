@@ -6,20 +6,9 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from urllib.parse import urljoin
 import io
-
 import pandas as pd
-
 from abi.fetch import fetch_endpoints
-from app.services.abi_service import (
-    load_tables_from_disk,
-    save_tables_to_disk,
-    list_tables_meta,
-    get_table_csv,
-)
-
-# ✅ shared in-memory store for cross-router access
 from app.core.table_store import TABLE_STORE
-
 router = APIRouter(prefix="/tables", tags=["Tables"])
 
 
@@ -34,9 +23,9 @@ class EndpointIn(BaseModel):
 
 
 class FetchRequest(BaseModel):
-    workspace_id: str = "default"  # ✅ NEW
+    workspace_id: str = "default"  # workspace / customer / environment
     base_url: str
-    token: Optional[str] = None    # ✅ token optional (cookie-first)
+    token: Optional[str] = None    # token optional (cookie-first)
     endpoints: List[EndpointIn]
     flatten: bool = True
 
@@ -93,7 +82,9 @@ def fetch_all(
             }
         )
 
-    existing = load_tables_from_disk()
+    # ✅ workspace-aware existing tables (from memory only)
+    ws = (req.workspace_id or "default").strip() or "default"
+    existing = TABLE_STORE.get_tables(ws)
 
     tables, errors = fetch_endpoints(
         endpoints=endpoint_dicts,
@@ -105,11 +96,7 @@ def fetch_all(
         existing_tables=existing,
     )
 
-    # ✅ Persist to disk (current behavior)
-    save_tables_to_disk(tables)
-
-    # ✅ ALSO keep in memory per-workspace for other routers
-    ws = (req.workspace_id or "default").strip() or "default"
+    # ✅ keep in-memory store updated per workspace
     TABLE_STORE.set_tables(ws, tables)
 
     meta = [
@@ -121,7 +108,7 @@ def fetch_all(
 
 
 # -------------------------------------------------------------------
-# List tables
+# List tables (from TABLE_STORE only)
 # -------------------------------------------------------------------
 
 class TableListResponse(BaseModel):
@@ -129,36 +116,46 @@ class TableListResponse(BaseModel):
 
 
 @router.get("/list", response_model=TableListResponse)
-def list_tables():
-    meta_raw = list_tables_meta()
+def list_tables(workspace_id: str = "default"):
+    ws = (workspace_id or "default").strip() or "default"
+    tables = TABLE_STORE.get_tables(ws)
+
     meta = [
-        TableMeta(name=m["name"], rows=m["rows"], cols=m["cols"])
-        for m in meta_raw
+        TableMeta(name=name, rows=len(df), cols=df.shape[1])
+        for name, df in tables.items()
     ]
     return TableListResponse(tables=meta)
 
 
 # -------------------------------------------------------------------
-# Download CSV
+# Download CSV (from TABLE_STORE)
 # -------------------------------------------------------------------
 
 @router.get("/{table_name}/download")
-def download_table_csv(table_name: str):
-    try:
-        csv_str = get_table_csv(table_name)
-    except KeyError:
+def download_table_csv(
+    table_name: str,
+    workspace_id: str = "default",
+):
+    ws = (workspace_id or "default").strip() or "default"
+    df = TABLE_STORE.get(ws, table_name)
+    if df is None:
         raise HTTPException(status_code=404, detail="Table not found")
 
+    csv_str = df.to_csv(index=False)
     csv_bytes = csv_str.encode("utf-8")
+
     return StreamingResponse(
         io.BytesIO(csv_bytes),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{table_name}.csv"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{table_name}.csv"'
+        },
     )
 
 
+
 # -------------------------------------------------------------------
-# Preview table
+# Preview table (from TABLE_STORE)
 # -------------------------------------------------------------------
 
 class TablePreviewResponse(BaseModel):
@@ -167,18 +164,23 @@ class TablePreviewResponse(BaseModel):
 
 
 @router.get("/{table_name}/preview", response_model=TablePreviewResponse)
-def preview_table(table_name: str, limit: int = 10):
-    tables = load_tables_from_disk()
-    if table_name not in tables:
+def preview_table(
+    table_name: str,
+    limit: int = 10,
+    workspace_id: str = "default",
+):
+    ws = (workspace_id or "default").strip() or "default"
+    df = TABLE_STORE.get(ws, table_name)
+    if df is None:
         raise HTTPException(status_code=404, detail="Table not found")
 
-    df = tables[table_name].head(limit)
-    rows = df.to_dict(orient="records")
+    preview_df = df.head(limit)
+    rows = preview_df.to_dict(orient="records")
     return TablePreviewResponse(name=table_name, rows=rows)
 
 
 # -------------------------------------------------------------------
-# Upload CSV
+# Upload CSV → TABLE_STORE only
 # -------------------------------------------------------------------
 
 class UploadResponse(BaseModel):
@@ -190,7 +192,7 @@ class UploadResponse(BaseModel):
 @router.post("/upload-csv", response_model=UploadResponse)
 async def upload_csv(
     file: UploadFile = File(...),
-    workspace_id: str = "default",  # ✅ NEW (query param)
+    workspace_id: str = "default",  # query param
 ):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
@@ -203,12 +205,9 @@ async def upload_csv(
 
     name = file.filename.rsplit(".", 1)[0]
 
-    tables = load_tables_from_disk()
-    tables[name] = df
-    save_tables_to_disk(tables)
-
-    # ✅ keep memory store updated too (workspace-aware)
     ws = (workspace_id or "default").strip() or "default"
+    tables = TABLE_STORE.get_tables(ws)
+    tables[name] = df
     TABLE_STORE.set_tables(ws, tables)
 
     return UploadResponse(name=name, rows=len(df), cols=df.shape[1])

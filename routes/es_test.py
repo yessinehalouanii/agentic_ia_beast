@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+from datetime import datetime, timezone  # 👈 NEW
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, Any, Dict, List
@@ -22,6 +23,9 @@ from app.core.es_client import es
 
 # ✅ DYNAMIC client factory (from user input)
 from app.core.es_dynamic import make_es_client
+
+# ✅ TABLE STORE for analytics
+from app.core.table_store import TABLE_STORE
 
 router = APIRouter(prefix="/es", tags=["Elasticsearch"])
 
@@ -74,6 +78,23 @@ class EsRunDslRequest(BaseModel):
 
     dsl: str
     flatten: bool = True
+
+
+class EsLoadIndexRequest(BaseModel):
+    """
+    Load a FULL ES index into pandas and register it in TABLE_STORE
+    so /docs/ask-analytics can run on it.
+    """
+    base_url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    index_name: str
+
+    # where analytics will read tables from
+    workspace_id: str = "default"
+
+    # optionally override table name (default = index_name)
+    table_name: Optional[str] = None
 
 
 # ------------------------------------------------------------------
@@ -230,6 +251,181 @@ def _parse_es_dsl(dsl: str) -> tuple[Optional[str], Dict[str, Any]]:
     return index_part, body
 
 
+def _load_index_as_df(
+    client,
+    index_name: str,
+    page_size: int = 5000,
+) -> pd.DataFrame:
+    """
+    Stream the ENTIRE index into a single pandas DataFrame.
+
+    - Uses ES scroll API.
+    - No max docs limit (full index).
+    - Keeps nested fields as dicts (no flattening here).
+    """
+    all_docs: list[dict] = []
+
+    # Initial search with scroll
+    resp = client.search(
+        index=index_name,
+        body={"query": {"match_all": {}}},  # no filter
+        size=page_size,
+        scroll="2m",
+    )
+
+    scroll_id = resp.get("_scroll_id")
+    hits = resp.get("hits", {}).get("hits", [])
+
+    while hits:
+        for h in hits:
+            all_docs.append(h.get("_source", {}))
+
+        resp = client.scroll(scroll_id=scroll_id, scroll="2m")
+        scroll_id = resp.get("_scroll_id")
+        hits = resp.get("hits", {}).get("hits", [])
+
+    # Best-effort: clear scroll
+    if scroll_id:
+        try:
+            client.clear_scroll(scroll_id=scroll_id)
+        except Exception:
+            pass
+
+    if not all_docs:
+        return pd.DataFrame()
+
+    return pd.DataFrame(all_docs)
+
+
+def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Detect an aggregation of the form:
+      aggregations.visits_per_year.buckets[...].distinct_visits.value
+
+    It supports both:
+      - date_histogram on a date field (key_as_string + epoch key)
+      - terms aggregation on a year-like field  (key = 2023, 2024, 2025, ...)
+
+    Build a generic summary for all years:
+      - visits_by_year: {"2022": 123, "2023": 150, ...}
+      - start_year / end_year comparison (earliest vs latest)
+      - human-readable text.
+
+    Returns a dict or None if pattern not recognized.
+    """
+    if not aggregations:
+        return None
+
+    visits_per_year = aggregations.get("visits_per_year")
+    if not isinstance(visits_per_year, dict):
+        return None
+
+    buckets = visits_per_year.get("buckets") or []
+    if not buckets:
+        return None
+
+    visits_by_year: dict[str, int] = {}
+
+    for b in buckets:
+        year: Optional[str] = None
+
+        # 1) Prefer key_as_string if present (e.g. "2024-01-01T00:00:00.000Z")
+        kas = b.get("key_as_string")
+        if isinstance(kas, str) and len(kas) >= 4:
+            year = kas[:4]
+        else:
+            # 2) Fallback: treat small integers as literal years (e.g. 2023, 2024, 2025)
+            key = b.get("key")
+            if isinstance(key, (int, float)):
+                k_int = int(key)
+                if 1900 <= k_int <= 2100:
+                    year = str(k_int)
+                else:
+                    # 3) Last resort: treat as epoch_millis
+                    try:
+                        ts = key / 1000.0
+                        year = str(datetime.fromtimestamp(ts, tz=timezone.utc).year)
+                    except Exception:
+                        pass
+
+        if not year:
+            continue
+
+        dv = b.get("distinct_visits", {})
+        value = dv.get("value")
+        if value is None:
+            continue
+
+        visits_by_year[year] = int(value)
+
+    if not visits_by_year:
+        return None
+
+    # Optional cleanup: if we somehow got weird years (e.g. "0"), drop them
+    cleaned = {
+        y: v
+        for y, v in visits_by_year.items()
+        if y.isdigit() and 1900 <= int(y) <= 2100
+    }
+    if cleaned:
+        visits_by_year = cleaned
+
+    if not visits_by_year:
+        return None
+
+    # Sort years numerically as strings like "2022", "2023", ...
+    years_sorted = sorted(visits_by_year.keys(), key=int)
+    start_year = years_sorted[0]
+    end_year = years_sorted[-1]
+
+    start_value = visits_by_year[start_year]
+    end_value = visits_by_year[end_year]
+
+    # If only one year, just report that
+    if start_year == end_year:
+        text = f"In {start_year} you had {start_value} distinct visits."
+        return {
+            "visits_by_year": visits_by_year,
+            "start_year": start_year,
+            "end_year": end_year,
+            "start_value": start_value,
+            "end_value": end_value,
+            "delta": 0,
+            "pct_change": None,
+            "text": text,
+        }
+
+    # Multiple years: compare earliest vs latest
+    delta = end_value - start_value
+    pct_change = (delta / start_value * 100.0) if start_value else None
+
+    # Build a small timeline string like "2022: 100, 2023: 120, 2024: 95"
+    timeline_parts = [f"{y}: {visits_by_year[y]}" for y in years_sorted]
+    timeline_str = ", ".join(timeline_parts)
+
+    text = (
+        f"From {start_year} to {end_year}, distinct visits changed "
+        f"from {start_value} to {end_value}"
+    )
+    if pct_change is not None:
+        text += f" ({pct_change:+.1f}% change)."
+    else:
+        text += "."
+
+    text += f" Year-by-year: {timeline_str}."
+
+    return {
+        "visits_by_year": visits_by_year,
+        "start_year": start_year,
+        "end_year": end_year,
+        "start_value": start_value,
+        "end_value": end_value,
+        "delta": delta,
+        "pct_change": pct_change,
+        "text": text,
+    }
+
+
 # ------------------------------------------------------------------
 # 1) Dynamic ES connection (used by EsConnectPanel)
 # ------------------------------------------------------------------
@@ -318,6 +514,62 @@ def sample_index_dynamic(
             return docs
 
         return _flatten_docs_to_rows(docs)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------------------------------------------------
+# 1.c.2) Load FULL index into TABLE_STORE for analytics
+# ------------------------------------------------------------------
+
+@router.post("/load-index-to-tables")
+def load_index_to_tables(req: EsLoadIndexRequest):
+    """
+    Load a FULL Elasticsearch index into pandas and register it
+    as a table in the in-memory TABLE_STORE for analytics.
+
+    Then /docs/ask-analytics can use it via workspace_id.
+    """
+    try:
+        client = make_es_client(req.base_url, req.username, req.password)
+
+        if not client.ping():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not ping Elasticsearch at {req.base_url}",
+            )
+
+        index_name = (req.index_name or "").strip()
+        if not index_name:
+            raise HTTPException(status_code=400, detail="index_name is required")
+
+        df = _load_index_as_df(client, index_name)
+        if df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Index '{index_name}' returned no documents.",
+            )
+
+        # workspace + table name
+        ws = (req.workspace_id or "default").strip() or "default"
+        table_name = (req.table_name or index_name).strip()
+
+        # Merge with existing tables for this workspace
+        existing = TABLE_STORE.get_tables(ws) or {}
+        existing[table_name] = df
+
+        TABLE_STORE.set_tables(ws, existing)
+
+        return {
+            "ok": True,
+            "workspace_id": ws,
+            "table_name": table_name,
+            "rows": len(df),
+            "cols": df.shape[1],
+        }
 
     except HTTPException:
         raise
@@ -428,6 +680,11 @@ def run_dsl_dynamic(req: EsRunDslRequest):
         if req.flatten and docs:
             docs = _flatten_docs_to_rows(docs)
 
+        aggregations = res.get("aggregations") or {}
+
+        # 👇 NEW: generic summary for visits_per_year + distinct_visits
+        summary = _summarize_visits_per_year_agg(aggregations)
+
         return {
             "ok": True,
             "index": index_name,
@@ -436,8 +693,9 @@ def run_dsl_dynamic(req: EsRunDslRequest):
             "raw": {
                 "took": res.get("took"),
                 "total": res.get("hits", {}).get("total"),
-                "aggregations": res.get("aggregations"),
+                "aggregations": aggregations,
             },
+            "summary": summary,
         }
 
     except HTTPException:

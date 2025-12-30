@@ -12,6 +12,7 @@ from helpers.analytics_helpers import (
     add_service_channel_visits,
     build_customer_channel_map_from_visits,
     merge_customer_channel_into_snapshot,
+    _expand_es_nested_columns,
 )
 
 import pandas as pd
@@ -44,18 +45,17 @@ _SCHEMA_CACHE: dict[str, str] = {}
 
 
 def _schema_cache_key(tables: Dict) -> str:
-    """
-    Build a simple cache key based on table names and column lists.
-    Avoids recomputing schema text across questions when tables don't change.
-    """
     parts = []
     for tname, df in tables.items():
         try:
+            if isinstance(df, pd.DataFrame):
+                df = _expand_es_nested_columns(df)  # ✅ expand nested ES objs
             cols = list(df.columns)
         except Exception:
             cols = []
         parts.append(f"{tname}:{','.join(map(str, cols))}")
     return "|".join(sorted(parts))
+
 
 
 def _build_schema_and_hints(tables: Dict) -> str:

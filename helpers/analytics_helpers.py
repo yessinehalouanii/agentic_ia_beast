@@ -80,8 +80,6 @@ def resolve_column(df: Any, user_term=None, alias_family=None):
             if "location" in name:
                 return col
 
-    # 5) Generic fallback for some other common families (if you want to extend later)
-
     # Final: log once and return None
     print(
         f"resolve_column: could not resolve user_term='{user_term}' alias_family='{alias_family}' "
@@ -95,6 +93,7 @@ def resolve_column(df: Any, user_term=None, alias_family=None):
 # ============================================================
 def resolve_visit_col(mdf: pd.DataFrame):
     return resolve_column(mdf, alias_family="visit")
+
 
 # ============================================================
 # Customer-level simple helpers
@@ -161,6 +160,65 @@ def _clean_columns_local(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# ES nested columns expander
+# ============================================================
+def _expand_es_nested_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expand common nested ES objects (customer, location, route, items)
+    into simple scalar columns so that resolve_column() can find them.
+
+    Works safely on non-ES data too (it just does nothing if those cols
+    aren't dict/list).
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    df = df.copy()
+
+    # --------- customer { first_name, last_name } ----------
+    if "customer" in df.columns:
+        is_dict = df["customer"].map(lambda x: isinstance(x, dict)).any()
+        if is_dict:
+            df["customer_first_name"] = df["customer"].map(
+                lambda x: (x or {}).get("first_name")
+            )
+            df["customer_last_name"] = df["customer"].map(
+                lambda x: (x or {}).get("last_name")
+            )
+
+            # Combined name
+            df["customer_name"] = (
+                df["customer_first_name"].fillna("").astype(str)
+                + " "
+                + df["customer_last_name"].fillna("").astype(str)
+            ).str.strip()
+
+    # --------- location { name } ----------
+    if "location" in df.columns:
+        is_dict = df["location"].map(lambda x: isinstance(x, dict)).any()
+        if is_dict:
+            df["location_name"] = df["location"].map(
+                lambda x: (x or {}).get("name")
+            )
+
+    # --------- route { name } ----------
+    if "route" in df.columns:
+        is_dict = df["route"].map(lambda x: isinstance(x, dict)).any()
+        if is_dict:
+            df["route_name"] = df["route"].map(
+                lambda x: (x or {}).get("name")
+            )
+
+    # --------- items [ { ... } ] ----------
+    if "items" in df.columns:
+        is_list = df["items"].map(lambda x: isinstance(x, list)).any()
+        if is_list:
+            df["items_count"] = df["items"].map(lambda x: len(x or []))
+
+    return df
+
+
+# ============================================================
 # Customer snapshot builder (used by runtime)
 # ============================================================
 def _find_pickup_amount_col(df: pd.DataFrame, resolver):
@@ -209,6 +267,9 @@ def _build_customer_snapshot(mdf: pd.DataFrame, resolver) -> pd.DataFrame:
 
     # Always clean columns first (flatten+dedupe)
     df = _clean_columns_local(mdf)
+
+    # ✅ Expand common ES nested objects (customer/location/route/items)
+    df = _expand_es_nested_columns(df)
 
     # Core identifiers
     cust_src_col = resolver(df, alias_family="customer")
@@ -483,6 +544,8 @@ def _build_customer_snapshot(mdf: pd.DataFrame, resolver) -> pd.DataFrame:
     snapshot = snapshot[existing + others]
 
     return snapshot.reset_index(drop=True)
+
+
 def add_service_channel_visits(mdf: pd.DataFrame) -> pd.DataFrame:
     """
     Adds a visit-level service_channel column: ROUTE vs RETAIL.
@@ -492,6 +555,9 @@ def add_service_channel_visits(mdf: pd.DataFrame) -> pd.DataFrame:
         return mdf
 
     df = mdf.copy()
+
+    # ✅ Expand nested ES objects so location_name exists
+    df = _expand_es_nested_columns(df)
 
     loc_name_col = resolve_column(df, "location.name", alias_family="location")
 
@@ -519,6 +585,9 @@ def build_customer_channel_map_from_visits(visits_df: pd.DataFrame) -> pd.DataFr
 
     df = visits_df.copy()
 
+    # ✅ Expand nested ES objects once
+    df = _expand_es_nested_columns(df)
+
     cust_col = resolve_column(df, alias_family="customer")
     if cust_col is None or cust_col not in df.columns:
         return pd.DataFrame(columns=out_cols)
@@ -527,7 +596,7 @@ def build_customer_channel_map_from_visits(visits_df: pd.DataFrame) -> pd.DataFr
     if "service_channel" not in df.columns:
         df = add_service_channel_visits(df)
 
-    # ✅ NEW: try to count DISTINCT visits using visit_id (or alias)
+    # ✅ Try to count DISTINCT visits using visit_id (or alias)
     visit_col = resolve_visit_col(df)
 
     if visit_col is not None and visit_col in df.columns:

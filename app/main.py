@@ -1,5 +1,8 @@
 # app/main.py
 
+import os
+from dotenv import load_dotenv  # 👈 add this
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10,7 +13,8 @@ from app.api.documents_routes import router as documents_router
 from app.api.chat_routes import router as chat_router
 from app.api.docs_analytics_routes import router as docs_analytics_router
 
-
+# 🔹 Load .env BEFORE creating app / routers
+load_dotenv()  # 👈 this is what makes OPENAI_API_KEY visible
 
 app = FastAPI(title="Agentic AI API")
 
