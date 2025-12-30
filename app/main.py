@@ -18,9 +18,13 @@ load_dotenv()  # 👈 this is what makes OPENAI_API_KEY visible
 
 app = FastAPI(title="Agentic AI API")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://agentic-ia-frontend.vercel.app",
+    "https://agentic-ia-frontend-r27k8srw6-yessines-projects-009bbb37.vercel.app",
 ]
 
 app.add_middleware(
@@ -30,6 +34,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 app.include_router(auth_router)
 app.include_router(tables_router)
