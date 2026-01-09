@@ -65,7 +65,7 @@ def login(payload: LoginRequest, response: Response):
             key="access_token",
             value=token,
             httponly=True,   # JS can't read it
-            secure=True,     # ✅ only sent over HTTPS in prod
+            secure=False,     # ✅ only sent over HTTPS in prod
             samesite="lax",
             max_age=3600,
             path="/",

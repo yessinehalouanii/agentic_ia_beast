@@ -3,6 +3,7 @@
 import pandas as pd
 import numpy as np  # ✅ For NaN/Inf cleanup
 from typing import Any, Dict, Tuple
+import ast  # ✅ For static safety checks on generated code
 
 # Only this at top to avoid circular imports
 from helpers.analytics_helpers import resolve_column
@@ -282,12 +283,71 @@ def runtime_normalize_mdf_env(env: dict[str, Any]) -> None:
 
 
 # =====================================================================
-# ✅ Execute LLM-generated analytics code
+# ✅ Safe execution of LLM-generated analytics code
 # =====================================================================
+
+# --- Simple static safety checks on the generated code (no imports, no dangerous calls) ---
+
+_FORBIDDEN_NAMES = {"__import__", "eval", "exec", "open", "input", "compile"}
+_FORBIDDEN_ATTRS = {"__dict__", "__class__", "__mro__", "__subclasses__"}
+
+
+def _code_is_safe(code: str) -> bool:
+    """
+    Very simple AST-based safety check:
+      - Forbid any import statements.
+      - Forbid calls to dangerous builtins (exec, eval, __import__, open, input, compile).
+      - Forbid access to some dunder attributes that can help escape sandboxes.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        # Block imports entirely
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return False
+
+        # Block forbidden function calls by name
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_NAMES:
+                return False
+
+        # Block attribute access to sensitive dunder internals
+        if isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_ATTRS:
+            return False
+
+    return True
+
+
+# --- Restricted builtins for the exec environment ---
+
+SAFE_BUILTINS = {
+    "None": None,
+    "True": True,
+    "False": False,
+    "len": len,
+    "range": range,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "abs": abs,
+    "float": float,
+    "int": int,
+    "str": str,
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+    "set": set,
+    "tuple": tuple,
+    "print": print,  # optional for debugging inside generated code
+}
+
 
 def run_generated_code(code: str, tables: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, str]:
     """
-    Execute LLM-generated analytics code.
+    Execute LLM-generated analytics code in a restricted environment.
 
     The generated code must assign:
         result_df = <pd.DataFrame>
@@ -296,9 +356,18 @@ def run_generated_code(code: str, tables: Dict[str, pd.DataFrame]) -> Tuple[pd.D
     We also call runtime_normalize_mdf_env(env) first so that:
       - env["mdf"] exists
       - env["customer_snapshot"] exists
+
+    Security:
+      - AST-based safety check to reject imports and dangerous builtins.
+      - Restricted __builtins__ so the code cannot import modules,
+        open files, or touch the OS/network.
     """
     if not code or not isinstance(code, str):
         return pd.DataFrame(), "No code to execute."
+
+    # ✅ Static safety check before executing anything
+    if not _code_is_safe(code):
+        return pd.DataFrame(), "Generated code failed safety checks."
 
     # 👇 Import helpers here so we can expose them to the exec env
     from helpers.analytics_helpers import (
@@ -310,6 +379,7 @@ def run_generated_code(code: str, tables: Dict[str, pd.DataFrame]) -> Tuple[pd.D
     )
 
     env: Dict[str, Any] = {
+        "__builtins__": SAFE_BUILTINS,  # ✅ sandbox builtins
         "pd": pd,
         "tables": tables or {},
         "mdf": pd.DataFrame(),

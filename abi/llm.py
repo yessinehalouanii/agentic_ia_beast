@@ -16,7 +16,35 @@ from helpers.analytics_helpers import (
 )
 
 import pandas as pd
+_ENV_QUESTION_PATTERNS = [
+    ".env",
+    "env file",
+    "environment file",
+    "environment variables",
+    "env variables",
+    "api key",
+    "api_key",
+    "apikey",
+    "secret key",
+    "secret_key",
+    "db password",
+    "database password",
+    "jwt secret",
+    "jwt_secret",
+    "openai key",
+    "openai_api_key",
+]
 
+
+def is_question_about_env(question: str) -> bool:
+    """
+    Very simple content filter: detect questions trying to access
+    environment files / secrets / API keys, etc.
+    """
+    if not question:
+        return False
+    q = question.lower()
+    return any(pat in q for pat in _ENV_QUESTION_PATTERNS)
 OPENAI_AVAILABLE = False
 try:
     from openai import OpenAI
@@ -224,6 +252,9 @@ def llm_codegen(
     - Uses schema + business hints.
     - Caches code per (question, model, schema_signature, rules_signature) to speed up repeats.
     """
+    if is_question_about_env(question):
+        print("llm_codegen: blocked env-related question:", repr(question))
+        return None
     if not OPENAI_AVAILABLE:
         print("llm_codegen: OPENAI_AVAILABLE is False")
         return None

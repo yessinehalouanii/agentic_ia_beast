@@ -1,180 +1,179 @@
 # abi/es_llm.py
+"""
+LLM → Elasticsearch DSL generator.
+
+Used by routes/es_test.py:
+
+    from abi.es_llm import llm_generate_es_query
+
+It takes:
+  - natural-language question
+  - index name
+  - ES mappings (properties)
+and returns a single ES request as plain text:
+
+    GET <index>/_search
+    {
+      ...
+    }
+"""
+
+from __future__ import annotations
+
 import json
+import re
 from typing import Any, Dict, Optional
 
+OPENAI_AVAILABLE = False
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
-except Exception:
-    OPENAI_AVAILABLE = False
+except Exception as e:
+    print("OpenAI import failed in abi.es_llm:", repr(e))
 
 
-def _collect_field_types(mappings: Dict[str, Any]) -> tuple[list[str], list[str]]:
+def _strip_code_fences(text: str) -> str:
     """
-    Walk the mapping and collect:
-      - date_fields: fields with type "date" or "date_nanos"
-      - year_like_fields: numeric/keyword fields whose name includes "year"
+    Remove ```json ... ``` or ``` ... ``` wrappers if present.
     """
-    date_fields: list[str] = []
-    year_like_fields: list[str] = []
+    return re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        text.strip(),
+        flags=re.MULTILINE,
+    ).strip()
 
-    # In our routes we usually pass {"properties": {...}}, but be defensive
-    props = mappings.get("properties") if isinstance(mappings, dict) else None
-    if not isinstance(props, dict):
-        props = mappings or {}
 
-    def walk(path: str, spec: Any):
-        if not isinstance(spec, dict):
-            return
+def _ensure_get_search_format(
+    text: str,
+    index_name: str,
+) -> str:
+    """
+    Make sure the output looks like:
 
-        ftype = spec.get("type")
-        fname = path
+        GET index/_search
+        { ... }
 
-        # Date-like fields
-        if ftype in ("date", "date_nanos"):
-            date_fields.append(fname)
+    If the model only returns JSON, wrap it.
+    """
+    stripped = text.strip()
+    if stripped.upper().startswith("GET "):
+        return stripped
 
-        # "year"-looking fields that are numeric or keyword-like
-        if (
-            ftype in ("integer", "long", "short", "byte", "float", "double", "keyword")
-            and "year" in fname.lower()
-        ):
-            year_like_fields.append(fname)
-
-        # Recurse nested properties
-        nested = spec.get("properties")
-        if isinstance(nested, dict):
-            for sub_name, sub_spec in nested.items():
-                child_path = f"{fname}.{sub_name}" if fname else sub_name
-                walk(child_path, sub_spec)
-
-    if isinstance(props, dict):
-        for root_name, root_spec in props.items():
-            walk(root_name, root_spec)
-
-    return date_fields, year_like_fields
+    # Try to treat the whole thing as JSON
+    try:
+        body = json.loads(stripped)
+        body_str = json.dumps(body, indent=2, ensure_ascii=False)
+        return f"GET {index_name}/_search\n{body_str}"
+    except Exception:
+        # Fallback: just prefix a GET line
+        return f"GET {index_name}/_search\n{stripped}"
 
 
 def llm_generate_es_query(
     question: str,
     index_name: str,
     mappings: Dict[str, Any],
-    model: str,
-    api_key: Optional[str],
+    model: str = "gpt-4o-mini",
+    api_key: Optional[str] = None,
 ) -> str:
     """
-    Returns ONLY:
-    GET <index>/_search
-    { Elasticsearch JSON body }
-    """
+    Main entry point used by /es/ask/dynamic.
 
+    Returns a **plain text** ES DSL string.
+    """
     if not OPENAI_AVAILABLE:
-        raise RuntimeError("OpenAI SDK not available")
+        raise RuntimeError("OpenAI client is not available (import failed).")
     if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY")
+        raise RuntimeError("Missing OpenAI API key for llm_generate_es_query.")
 
     client = OpenAI(api_key=api_key)
 
-    # 🔎 Pre-compute helpful hints for the model from the mapping
-    date_fields, year_like_fields = _collect_field_types(mappings)
+    # We only need properties for the prompt; keep it small-ish.
+    properties = (mappings or {}).get("properties", mappings or {})
+    mapping_str = json.dumps(properties, indent=2, ensure_ascii=False)
 
+    # 🔥 STRONG SYSTEM PROMPT TO ENFORCE GOOD ES DSL
     system = (
-        "You are an Elasticsearch DSL generator.\n"
-        "Your job is to produce a single Elasticsearch query that answers the question.\n\n"
-
-        "OUTPUT FORMAT (MUST FOLLOW EXACTLY):\n"
-        "GET <index>/_search\n"
-        "{ valid Elasticsearch JSON body }\n\n"
-
-        "STRICT RULES (DO NOT BREAK):\n"
-        "- Output NOTHING except the DSL.\n"
-        "- No explanations.\n"
-        "- No markdown.\n"
-        "- No comments.\n"
-        "- No analysis.\n"
-        "- DO NOT invent date ranges.\n"
-        "- DO NOT add time filters unless explicitly requested in the question.\n"
-        "- DO NOT infer years, months, or ranges not mentioned by the user.\n"
-        "- Use bool.filter, NOT bool.must, for hard filters unless scoring is required.\n"
-        "- Keep numeric filters as range queries where appropriate.\n"
-        "- Use painless scripts ONLY when absolutely required and there is no native aggregation.\n\n"
-
-        "MAPPING TYPE RULES (VERY IMPORTANT):\n"
-        "- You are given the index MAPPING JSON and precomputed lists of DATE_FIELDS and YEAR_LIKE_FIELDS.\n"
-        "- ALWAYS respect the 'type' from the mapping:\n"
-        "  * If a field has type 'date' or 'date_nanos', you MAY use date_histogram and range queries on it.\n"
-        "  * If a field has type 'integer', 'long', 'short', 'byte', 'float', 'double', or 'keyword',\n"
-        "    you MUST NOT use date_histogram on that field.\n"
-        "- For fields listed in YEAR_LIKE_FIELDS (e.g. 'import_year' with values 2024, 2025):\n"
-        "  * Treat them as year dimensions (numeric or keyword), NOT as dates.\n"
-        "  * Use 'terms' aggregation or 'filter' aggregations (term/terms) on that field to group/compare years.\n"
-        "  * Do NOT use date_histogram on these year fields.\n\n"
-
-        "FIELD NAME RULES:\n"
-        "- If the QUESTION explicitly mentions a field name (e.g. 'use import_at field'),\n"
-        "  you MUST use exactly that field for filters and/or aggregations related to that concept.\n"
-        "- Do NOT silently switch to a different field name.\n\n"
-
-        "DATE / TIME & GROUP BY RULES:\n"
-        "- Only use date_histogram on fields that are actual date types in the mapping.\n"
-        "- If the question asks for metrics PER YEAR, PER MONTH, PER DAY, etc.,\n"
-        "  use date_histogram on the appropriate *date* field instead of scripts.\n"
-        "- Example: for per-year metrics on a date field, use:\n"
-        "  \"date_histogram\": { \"field\": \"<date_field>\", \"calendar_interval\": \"year\" }\n"
-        "- Never use doc['<date_field>'].value.getYear() + 1900 or similar hacks.\n"
-        "- Only use scripts on dates if there is truly no alternative.\n"
-        "- For general group-by on non-date fields, use terms aggregation.\n\n"
-
-        "VISITS / DISTINCT COUNTS RULES:\n"
-        "- If the question refers to 'distinct visits', 'unique visits', or 'number of visits',\n"
-        "  and the mapping contains a field like 'visit_id' (keyword / id field),\n"
-        "  use a cardinality aggregation on that field:\n"
-        "    \"cardinality\": { \"field\": \"visit_id\" }\n"
-        "- If comparing visits across years (e.g. 2024 vs 2025):\n"
-        "  * If you have a DATE_FIELD (e.g. 'import_at', 'updated_at') and the question says to use it,\n"
-        "    you MAY use a date_histogram by year on that date field plus a cardinality sub-aggregation.\n"
-        "  * If you have a YEAR_LIKE_FIELD (e.g. 'import_year' = 2024, 2025),\n"
-        "    you MUST use terms or filter aggregations on that year field, NOT date_histogram.\n"
-        "- Do NOT use scripts to extract the year from a date when date_histogram can do it.\n\n"
-
-        "FILTERING RULES:\n"
-        "- If the question mentions an explicit date range, use a range query on the relevant date field.\n"
-        "- If the question mentions a specific year (e.g. 2024) and you are using a date field, convert that into\n"
-        "  a range [2024-01-01, 2025-01-01) on that date field.\n"
-        "- If the question mentions a specific year and you have a YEAR_LIKE_FIELD (e.g. 'import_year'),\n"
-        "  you may instead filter using term/terms on that year field.\n"
-        "- For weekday filtering, if explicitly requested, use painless with:\n"
-        "  doc['<date_field>'].size()!=0 &&\n"
-        "  doc['<date_field>'].value.getDayOfWeek().getValue() == <1-7>\n"
-        "  where Monday = 1.\n\n"
-
+        "You are an expert Elasticsearch engineer. Your ONLY job is to translate a "
+        "natural-language analytics question into a single Elasticsearch search request.\n"
+        "\n"
+        "OUTPUT FORMAT (VERY IMPORTANT):\n"
+        "  - Return ONLY plain text, no markdown, no backticks, no comments.\n"
+        "  - First line: GET <index-name>/_search\n"
+        "  - Then a newline, then a JSON object body.\n"
+        "  - The JSON MUST be syntactically valid (double-quoted keys, proper commas, etc.).\n"
+        "\n"
+        "GENERAL QUERY RULES:\n"
+        "  - Use ONLY fields that exist in the provided mappings.\n"
+        "  - If a field has both `text` and `keyword` subfields, use the `keyword` subfield for\n"
+        "    exact filters and aggregations (e.g. `customer_name.keyword`).\n"
+        "  - Prefer `bool` queries with `must`, `filter`, `must_not`, `should` instead of `query_string`.\n"
+        "  - For exact matches on keyword fields use `term` or `terms`.\n"
+        "  - For full-text search on text fields use `match` or `multi_match` (sparingly).\n"
+        "  - For numeric fields use `range`, `term`, or aggregations (`sum`, `avg`, etc.).\n"
+        "  - DO NOT use scripts or painless; queries must be safe and performant.\n"
+        "  - Always include a reasonable `size`:\n"
+        "      * If the user only cares about KPIs / metrics → use `size: 0`.\n"
+        "      * If the user wants example documents → use a small size like 50.\n"
+        "  - When counts/percentages matter, add `track_total_hits: true`.\n"
+        "\n"
+        "DATE / TIME RULES:\n"
+        "  - Use `range` queries on date fields with `gte`/`lte`.\n"
+        "  - For relative ranges use:\n"
+        "      * last 7 days   → `now-7d/d`\n"
+        "      * last 30 days  → `now-30d/d`\n"
+        "      * last 12 months / last year → `now-12M/M` or `now-1y/y`\n"
+        "  - Choose the most appropriate date field from mappings (names containing\n"
+        "    `created`, `date`, `timestamp`, `dropoff`, `pickup`, etc.).\n"
+        "\n"
         "AGGREGATION RULES:\n"
-        "- Aggregations MUST reflect the question exactly.\n"
-        "- If the user asks to compare metrics between two periods (e.g. 2024 vs 2025),\n"
-        "  include aggregations that produce buckets/values for each period so that\n"
-        "  the client code can compare them.\n"
-        "- Do NOT compute ratios or differences in scripts unless explicitly requested;\n"
-        "  just return the raw per-period metrics (e.g. per year).\n"
+        "  - If the question asks for **totals**, **sums**, **revenue**, or **amounts**, use metric\n"
+        "    aggregations such as `sum`, `avg`, or `value_count` on numeric fields.\n"
+        "  - If the question asks for **how many** or **count** per dimension (customer, location,\n"
+        "    status, etc.), use `terms` aggregations on the appropriate keyword field.\n"
+        "  - For **top N** entities (top customers, top locations, etc.), use `terms` aggregation\n"
+        "    with `size` = N and order by a metric (e.g. sum of revenue).\n"
+        "  - For **trends over time** (per day, per week, per month, per year, over time), use a\n"
+        "    `date_histogram` on a date field with a reasonable `calendar_interval` (e.g. `day`,\n"
+        "    `week`, or `month`).\n"
+        "  - Nest aggregations logically (e.g. `date_histogram` → `terms` → `sum`).\n"
+        "\n"
+        "MULTI-INDEX / OTHER RULES:\n"
+        "  - Assume the request targets exactly ONE index: the `Target index` provided.\n"
+        "  - Do NOT use cross-cluster search or index patterns.\n"
+        "  - Do NOT invent fields: every field you reference must exist in the mappings.\n"
+        "\n"
+        "FINAL ANSWER REQUIREMENTS:\n"
+        "  - Your final answer MUST be exactly one Elasticsearch search request in the format:\n"
+        "        GET <index-name>/_search\n"
+        "        { JSON body }\n"
+        "  - No markdown, no prose, no explanation, no comments, no surrounding backticks.\n"
     )
 
     user = (
-        f"INDEX: {index_name}\n"
-        f"DATE_FIELDS (from mapping): {date_fields}\n"
-        f"YEAR_LIKE_FIELDS (from mapping): {year_like_fields}\n"
-        f"MAPPING:\n{json.dumps(mappings, ensure_ascii=False)[:120000]}\n\n"
-        f"QUESTION:\n{question}\n"
+        f"User question:\n{question}\n\n"
+        f"Target index: {index_name}\n\n"
+        "Elasticsearch mappings (properties):\n"
+        f"{mapping_str}\n\n"
+        "Write exactly ONE Elasticsearch search request that best answers the question, "
+        "following ALL the rules above."
     )
 
-    resp = client.responses.create(
+    # Simple implementation using chat.completions.
+    resp = client.chat.completions.create(
         model=model,
-        instructions=system,
-        input=user,
-        temperature=0.0,
-        max_output_tokens=900,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.1,
+        max_tokens=800,
     )
 
-    text = (getattr(resp, "output_text", "") or "").strip()
-    if not text:
-        raise RuntimeError("Empty model response")
+    content = resp.choices[0].message.content or ""
+    content = _strip_code_fences(content)
+    if not content.strip():
+        raise RuntimeError("llm_generate_es_query: model returned empty content.")
 
-    return text
+    return _ensure_get_search_format(content, index_name=index_name)

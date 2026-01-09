@@ -24,8 +24,8 @@ from app.core.es_client import es
 # ✅ DYNAMIC client factory (from user input)
 from app.core.es_dynamic import make_es_client
 
-# ✅ TABLE STORE for analytics
-from app.core.table_store import TABLE_STORE
+# ❌ DISABLED: TABLE STORE for analytics (we are NOT loading full index into pandas)
+# from app.core.table_store import TABLE_STORE
 
 router = APIRouter(prefix="/es", tags=["Elasticsearch"])
 
@@ -80,21 +80,24 @@ class EsRunDslRequest(BaseModel):
     flatten: bool = True
 
 
-class EsLoadIndexRequest(BaseModel):
-    """
-    Load a FULL ES index into pandas and register it in TABLE_STORE
-    so /docs/ask-analytics can run on it.
-    """
-    base_url: str
-    username: Optional[str] = None
-    password: Optional[str] = None
-    index_name: str
-
-    # where analytics will read tables from
-    workspace_id: str = "default"
-
-    # optionally override table name (default = index_name)
-    table_name: Optional[str] = None
+# ------------------------------------------------------------------
+# ❌ DISABLED: FULL INDEX LOAD MODEL (prod-safe)
+# ------------------------------------------------------------------
+# class EsLoadIndexRequest(BaseModel):
+#     """
+#     Load a FULL ES index into pandas and register it in TABLE_STORE
+#     so /docs/ask-analytics can run on it.
+#     """
+#     base_url: str
+#     username: Optional[str] = None
+#     password: Optional[str] = None
+#     index_name: str
+#
+#     # where analytics will read tables from
+#     workspace_id: str = "default"
+#
+#     # optionally override table name (default = index_name)
+#     table_name: Optional[str] = None
 
 
 # ------------------------------------------------------------------
@@ -251,50 +254,53 @@ def _parse_es_dsl(dsl: str) -> tuple[Optional[str], Dict[str, Any]]:
     return index_part, body
 
 
-def _load_index_as_df(
-    client,
-    index_name: str,
-    page_size: int = 5000,
-) -> pd.DataFrame:
-    """
-    Stream the ENTIRE index into a single pandas DataFrame.
-
-    - Uses ES scroll API.
-    - No max docs limit (full index).
-    - Keeps nested fields as dicts (no flattening here).
-    """
-    all_docs: list[dict] = []
-
-    # Initial search with scroll
-    resp = client.search(
-        index=index_name,
-        body={"query": {"match_all": {}}},  # no filter
-        size=page_size,
-        scroll="2m",
-    )
-
-    scroll_id = resp.get("_scroll_id")
-    hits = resp.get("hits", {}).get("hits", [])
-
-    while hits:
-        for h in hits:
-            all_docs.append(h.get("_source", {}))
-
-        resp = client.scroll(scroll_id=scroll_id, scroll="2m")
-        scroll_id = resp.get("_scroll_id")
-        hits = resp.get("hits", {}).get("hits", [])
-
-    # Best-effort: clear scroll
-    if scroll_id:
-        try:
-            client.clear_scroll(scroll_id=scroll_id)
-        except Exception:
-            pass
-
-    if not all_docs:
-        return pd.DataFrame()
-
-    return pd.DataFrame(all_docs)
+# ------------------------------------------------------------------
+# ❌ DISABLED: FULL INDEX LOADER (prod-safe)
+# ------------------------------------------------------------------
+# def _load_index_as_df(
+#     client,
+#     index_name: str,
+#     page_size: int = 5000,
+# ) -> pd.DataFrame:
+#     """
+#     Stream the ENTIRE index into a single pandas DataFrame.
+#
+#     - Uses ES scroll API.
+#     - No max docs limit (full index).
+#     - Keeps nested fields as dicts (no flattening here).
+#
+#     ⚠️ DISABLED: can overload ES + crash API (RAM).
+#     """
+#     all_docs: list[dict] = []
+#
+#     resp = client.search(
+#         index=index_name,
+#         body={"query": {"match_all": {}}},  # no filter
+#         size=page_size,
+#         scroll="2m",
+#     )
+#
+#     scroll_id = resp.get("_scroll_id")
+#     hits = resp.get("hits", {}).get("hits", [])
+#
+#     while hits:
+#         for h in hits:
+#             all_docs.append(h.get("_source", {}))
+#
+#         resp = client.scroll(scroll_id=scroll_id, scroll="2m")
+#         scroll_id = resp.get("_scroll_id")
+#         hits = resp.get("hits", {}).get("hits", [])
+#
+#     if scroll_id:
+#         try:
+#             client.clear_scroll(scroll_id=scroll_id)
+#         except Exception:
+#             pass
+#
+#     if not all_docs:
+#         return pd.DataFrame()
+#
+#     return pd.DataFrame(all_docs)
 
 
 def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -361,7 +367,6 @@ def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dic
     if not visits_by_year:
         return None
 
-    # Optional cleanup: if we somehow got weird years (e.g. "0"), drop them
     cleaned = {
         y: v
         for y, v in visits_by_year.items()
@@ -373,7 +378,6 @@ def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dic
     if not visits_by_year:
         return None
 
-    # Sort years numerically as strings like "2022", "2023", ...
     years_sorted = sorted(visits_by_year.keys(), key=int)
     start_year = years_sorted[0]
     end_year = years_sorted[-1]
@@ -381,7 +385,6 @@ def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dic
     start_value = visits_by_year[start_year]
     end_value = visits_by_year[end_year]
 
-    # If only one year, just report that
     if start_year == end_year:
         text = f"In {start_year} you had {start_value} distinct visits."
         return {
@@ -395,11 +398,9 @@ def _summarize_visits_per_year_agg(aggregations: Dict[str, Any]) -> Optional[Dic
             "text": text,
         }
 
-    # Multiple years: compare earliest vs latest
     delta = end_value - start_value
     pct_change = (delta / start_value * 100.0) if start_value else None
 
-    # Build a small timeline string like "2022: 100, 2023: 120, 2024: 95"
     timeline_parts = [f"{y}: {visits_by_year[y]}" for y in years_sorted]
     timeline_str = ", ".join(timeline_parts)
 
@@ -522,59 +523,22 @@ def sample_index_dynamic(
 
 
 # ------------------------------------------------------------------
-# 1.c.2) Load FULL index into TABLE_STORE for analytics
+# ❌ DISABLED: Load FULL index into TABLE_STORE for analytics (prod-safe)
 # ------------------------------------------------------------------
-
-@router.post("/load-index-to-tables")
-def load_index_to_tables(req: EsLoadIndexRequest):
-    """
-    Load a FULL Elasticsearch index into pandas and register it
-    as a table in the in-memory TABLE_STORE for analytics.
-
-    Then /docs/ask-analytics can use it via workspace_id.
-    """
-    try:
-        client = make_es_client(req.base_url, req.username, req.password)
-
-        if not client.ping():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not ping Elasticsearch at {req.base_url}",
-            )
-
-        index_name = (req.index_name or "").strip()
-        if not index_name:
-            raise HTTPException(status_code=400, detail="index_name is required")
-
-        df = _load_index_as_df(client, index_name)
-        if df.empty:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Index '{index_name}' returned no documents.",
-            )
-
-        # workspace + table name
-        ws = (req.workspace_id or "default").strip() or "default"
-        table_name = (req.table_name or index_name).strip()
-
-        # Merge with existing tables for this workspace
-        existing = TABLE_STORE.get_tables(ws) or {}
-        existing[table_name] = df
-
-        TABLE_STORE.set_tables(ws, existing)
-
-        return {
-            "ok": True,
-            "workspace_id": ws,
-            "table_name": table_name,
-            "rows": len(df),
-            "cols": df.shape[1],
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @router.post("/load-index-to-tables")
+# def load_index_to_tables(req: EsLoadIndexRequest):
+#     """
+#     Load a FULL Elasticsearch index into pandas and register it
+#     as a table in the in-memory TABLE_STORE for analytics.
+#
+#     Then /docs/ask-analytics can use it via workspace_id.
+#
+#     ⚠️ DISABLED: This can overload Elasticsearch + crash the API (RAM).
+#     """
+#     raise HTTPException(
+#         status_code=403,
+#         detail="Disabled: bulk index load into pandas/TABLE_STORE is not allowed.",
+#     )
 
 
 # ------------------------------------------------------------------
@@ -601,11 +565,9 @@ def ask_es_dynamic(req: EsAskRequest):
         if not api_key:
             raise HTTPException(status_code=500, detail="Missing OpenAI API key")
 
-        # Get mapping
         mapping = client.indices.get_mapping(index=index_name)
         properties = _extract_properties_from_mapping(mapping, index_name)
 
-        # ✅ Generate ES query ONLY (no execution)
         query_text = llm_generate_es_query(
             question=question,
             index_name=index_name,
@@ -614,7 +576,6 @@ def ask_es_dynamic(req: EsAskRequest):
             api_key=api_key,
         )
 
-        # Return exactly what the model produced
         return {
             "ok": True,
             "query": query_text,
@@ -665,7 +626,6 @@ def run_dsl_dynamic(req: EsRunDslRequest):
                 detail="No index name found in DSL GET line",
             )
 
-        # Execute against the REAL ES index
         try:
             res = client.search(index=index_name, body=body)
         except Exception as e:
@@ -681,8 +641,6 @@ def run_dsl_dynamic(req: EsRunDslRequest):
             docs = _flatten_docs_to_rows(docs)
 
         aggregations = res.get("aggregations") or {}
-
-        # 👇 NEW: generic summary for visits_per_year + distinct_visits
         summary = _summarize_visits_per_year_agg(aggregations)
 
         return {
