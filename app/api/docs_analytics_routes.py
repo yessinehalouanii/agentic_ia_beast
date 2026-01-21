@@ -41,6 +41,60 @@ ES_AGG_MAX_COMPOSITE_SIZE = int(os.getenv("ES_AGG_MAX_COMPOSITE_SIZE", "1000"))
 
 
 # -------------------------------------------------------------------
+# ✅ DIRECT FIELD MAP (uses your known mappings; avoids resolver surprises)
+# -------------------------------------------------------------------
+
+INVOICE_FIELDS: Dict[str, str] = {
+    "customer_id": "customer_id",
+    "date": "dropoff_at",
+    "amount": "total",
+    "pieces": "pieces",
+    "visit_id": "visit_id",
+    "location_id": "location_id",
+}
+
+CUSTOMER_FIELDS: Dict[str, str] = {
+    "customer_id": "customer_id",
+    "signup": "original_signup",
+}
+
+
+def _field_exists(mappings: Dict[str, Any], field: str) -> bool:
+    """
+    Works with:
+      - flat dict from _extract_properties_from_mapping (keys are field paths), OR
+      - nested ES mapping style dict.
+    """
+    props = (mappings or {}).get("properties") or {}
+    if not isinstance(props, dict) or not field:
+        return False
+
+    # flat case
+    if field in props:
+        return True
+
+    # nested traversal case for "a.b.c"
+    node: Any = props
+    parts = field.split(".")
+    for part in parts:
+        if not isinstance(node, dict):
+            return False
+
+        # typical nested mapping: node[part] is field spec
+        if part in node:
+            spec = node[part]
+        # sometimes node is a spec with "properties"
+        elif "properties" in node and isinstance(node["properties"], dict) and part in node["properties"]:
+            spec = node["properties"][part]
+        else:
+            return False
+
+        node = spec
+
+    return True
+
+
+# -------------------------------------------------------------------
 # Request models
 # -------------------------------------------------------------------
 
@@ -79,7 +133,6 @@ class MetricsDashboardRequest(BaseModel):
     es_index_name: str
     es_username: Optional[str] = None
     es_password: Optional[str] = None
-    
 
     # customers index to support lifecycle / signup metrics
     es_customers_index_name: Optional[str] = None
@@ -295,10 +348,6 @@ def _sanitize_es_body_for_prod(
     # enforce window
     body = _apply_date_window_to_body(req, body, date_field=date_field)
 
-    # keep timeouts conservative (also enforced in _safe_es_search)
-    body.setdefault("timeout", "10s")
-    body.setdefault("track_total_hits", False)
-
     return body
 
 
@@ -333,58 +382,9 @@ def _maybe_prefer_keyword(
     kw_key = (resolved + ".keyword").lower()
     return lower_map.get(kw_key) or resolved
 
-
-# -------------------------------------------------------------------
-# Helper: decide if question is ES-friendly (currently unused)
-# -------------------------------------------------------------------
-
-def is_es_friendly_question(q: str) -> bool:
-    q = (q or "").lower()
-
-    simple_patterns = [
-        "total revenue",
-        "sum of total",
-        "revenue by location",
-        "revenue by day",
-        "revenue by month",
-        "grouped by location",
-        "grouped by channel",
-        "count of invoices",
-        "number of invoices",
-        "average ticket size",
-        "avg ticket size",
-    ]
-
-    special_patterns = [
-        "average customer lifetime value",
-        "average clv",
-        "one-time vs repeat customers",
-        "one time vs repeat customers",
-        "average days between visits",
-        "overdue for their next visit",
-        "overdue for next visit",
-        "lapsed customers",
-        "distribution of customers by visit frequency",
-        "top 5%",
-        "top 5 percent",
-        "top 20%",
-        "top 20 percent",
-        "month-over-month visit volume trend",
-        "month over month visit volume",
-        "seasonal patterns",
-        "seasonal revenue patterns",
-        "seasonal patterns vs last year",
-        "new customer acquisition rate",
-        "year-over-year revenue growth by location",
-        "year over year revenue growth by location",
-        "yoy revenue by location",
-    ]
-
-    return any(p in q for p in (simple_patterns + special_patterns))
-
-
 # -------------------------------------------------------------------
 # ES mapping + date helpers (shared by metric modules)
+# (kept for compatibility; your updated metrics can ignore it)
 # -------------------------------------------------------------------
 
 def resolve_es_field(
@@ -394,10 +394,7 @@ def resolve_es_field(
 ) -> Optional[str]:
     """
     Resolve an ES field path from index mappings.
-
-    ✅ Improvements:
-      - keeps existing alias matching behavior
-      - prefers .keyword when it exists for id/name/tag-ish fields (terms/cardinality safe)
+    (Kept for backwards compatibility with any modules that still import it.)
     """
     props = mappings.get("properties", {}) or {}
     flat_fields: List[str] = []
@@ -422,6 +419,19 @@ def resolve_es_field(
         has_props = isinstance(node.get("properties"), dict)
         has_fields = isinstance(node.get("fields"), dict)
 
+        # "nested" and "object" are containers — keep walking into their properties
+        if ftype in ("nested", "object") and has_props:
+            for sub_name, spec in node["properties"].items():
+                path = f"{prefix}.{sub_name}" if prefix else sub_name
+                _walk(path, spec)
+
+            if has_fields:
+                for sub_name, spec in node["fields"].items():
+                    path = f"{prefix}.{sub_name}"
+                    _walk(path, spec)
+            return
+
+        # leaf field OR non-container without properties/fields
         if ftype or not (has_props or has_fields):
             if prefix:
                 flat_fields.append(prefix)
@@ -558,6 +568,10 @@ def _select_invoice_index_from_es_mapping(
     return chosen, {chosen: full_mapping[chosen]}
 
 
+# -------------------------------------------------------------------
+# ✅ UPDATED: Direct-field versions (no resolve_es_field)
+# -------------------------------------------------------------------
+
 def _es_get_customer_signups(
     client,
     index_name: str,
@@ -567,17 +581,17 @@ def _es_get_customer_signups(
     From the customers index, return:
         { customer_id -> original_signup_date }
 
-    ✅ Uses COMPOSITE pagination (no 10k cap), but now has HARD CAPS + lower default max.
+    ✅ Uses COMPOSITE pagination (no 10k cap), with HARD CAPS + lower default max.
+    ✅ Uses direct fields from CUSTOMER_FIELDS.
     """
-    customer_field = resolve_es_field(mappings, user_term="customer_id", alias_family="customer")
-    signup_field = resolve_es_field(mappings, user_term="original_signup", alias_family="date")
+    customer_field = CUSTOMER_FIELDS["customer_id"]
+    signup_field = CUSTOMER_FIELDS["signup"]
 
-    if not (customer_field and signup_field):
+    if not (_field_exists(mappings, customer_field) and _field_exists(mappings, signup_field)):
         return {}
 
     signups: Dict[Any, datetime.date] = {}
 
-    # ✅ lowered default
     max_customers = int(os.getenv("ES_MAX_CUSTOMERS", str(ES_MAX_CUSTOMERS_DEFAULT)))
     seen = 0
 
@@ -615,27 +629,21 @@ def _es_get_customer_stats(
     """
     Aggregate per-customer stats in ES.
 
-    ✅ Uses COMPOSITE pagination (no 10k cap), but now has HARD CAPS + lower default max.
+    ✅ Uses COMPOSITE pagination (no 10k cap), with HARD CAPS + lower default max.
+    ✅ Uses direct fields from INVOICE_FIELDS.
     """
-    customer_field = resolve_es_field(mappings, user_term="customer_id", alias_family="customer")
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date")
-    amount_field = resolve_es_field(mappings, user_term="total", alias_family="amount")
+    customer_field = INVOICE_FIELDS["customer_id"]
+    date_field = INVOICE_FIELDS["date"]
+    amount_field = INVOICE_FIELDS["amount"]
+    visit_field = INVOICE_FIELDS["visit_id"]
+    pieces_field = INVOICE_FIELDS["pieces"]
 
-    # ✅ prefer keyword for cardinality stability
-    visit_field = (
-        resolve_es_field(mappings, user_term="visit_id.keyword", alias_family="visit")
-        or resolve_es_field(mappings, user_term="visit_id", alias_family="visit")
-    )
-
-    pieces_field = (
-        resolve_es_field(mappings, user_term="total_pieces", alias_family="pieces")
-        or resolve_es_field(mappings, user_term="pieces", alias_family="pieces")
-    )
-
-    if not customer_field or not date_field:
+    if not (_field_exists(mappings, customer_field) and _field_exists(mappings, date_field)):
         return None
 
-    has_visit_field = bool(visit_field)
+    has_visit_field = _field_exists(mappings, visit_field)
+    has_amount_field = _field_exists(mappings, amount_field)
+    has_pieces_field = _field_exists(mappings, pieces_field)
 
     if has_visit_field:
         per_customer_aggs: Dict[str, Any] = {
@@ -655,14 +663,13 @@ def _es_get_customer_stats(
             "visits_365": {"filter": {"range": {date_field: {"gte": "now-365d/d"}}}},
         }
 
-    if amount_field:
+    if has_amount_field:
         per_customer_aggs["total_revenue"] = {"sum": {"field": amount_field}}
-    if pieces_field:
+    if has_pieces_field:
         per_customer_aggs["total_pieces"] = {"sum": {"field": pieces_field}}
 
     stats: List[Dict[str, Any]] = []
 
-    # ✅ lowered default
     max_customers = int(os.getenv("ES_MAX_CUSTOMERS", str(ES_MAX_CUSTOMERS_DEFAULT)))
     seen = 0
 
@@ -686,19 +693,19 @@ def _es_get_customer_stats(
         if has_visit_field:
             vc = int(((b.get("visit_count") or {}).get("value")) or 0)
             v365 = int(
-                (((b.get("visits_365") or {}).get("visits_365_distinct") or {}).get("value")) or 0
+                ((((b.get("visits_365") or {}).get("visits_365_distinct") or {}).get("value")) or 0)
             )
         else:
             vc = int(((b.get("visit_count") or {}).get("value")) or 0)
             v365 = int(((b.get("visits_365") or {}).get("doc_count")) or 0)
 
         tr = None
-        if amount_field and "total_revenue" in b:
+        if has_amount_field and "total_revenue" in b:
             tr_val = (b.get("total_revenue") or {}).get("value")
             tr = float(tr_val) if tr_val is not None else 0.0
 
         tp = None
-        if pieces_field and "total_pieces" in b:
+        if has_pieces_field and "total_pieces" in b:
             tp_val = (b.get("total_pieces") or {}).get("value")
             tp = float(tp_val) if tp_val is not None else 0.0
 
@@ -740,6 +747,9 @@ def _route_es_special(
 
     q_lower = (req.question or "").lower()
 
+    # ------------------------------------------------------------
+    # Customer Value (existing)
+    # ------------------------------------------------------------
     if (
         "total visit amount" in q_lower
         or "total visit pieces" in q_lower
@@ -764,20 +774,254 @@ def _route_es_special(
     ):
         return metrics_customer_value._es_customer_value_metrics(req, client, mappings, business_rules)
 
+    if "one-time" in q_lower and "repeat" in q_lower and "customer" in q_lower:
+        return metrics_customer_value._es_one_time_vs_repeat(req, client, mappings, business_rules)
+
+    # ------------------------------------------------------------
+    # Promos / Coupons (existing)
+    # ------------------------------------------------------------
     if "average pickup delay" in q_lower:
         return metrics_promos_coupons._es_avg_pickup_delay_retail(req, client, mappings, business_rules)
 
     if ("top 20%" in q_lower and ("redo" in q_lower or "courtesy" in q_lower) and "customer" in q_lower):
         return metrics_promos_coupons._es_top20_customers_with_redo_courtesy(req, client, mappings, business_rules)
 
-    if ("top 20%" in q_lower and "overdue" in q_lower and "customer" in q_lower):
-        return metrics_lifecycle._es_top20_customers_overdue_14d(req, client, mappings, business_rules)
-
     if "redo" in q_lower and "invoice" in q_lower:
         return metrics_promos_coupons._es_invoices_with_redo_items(req, client, mappings, business_rules)
 
-    if "one-time" in q_lower and "repeat" in q_lower and "customer" in q_lower:
-        return metrics_customer_value._es_one_time_vs_repeat(req, client, mappings, business_rules)
+    if (
+        "coupon" in q_lower
+        and ("return" in q_lower or "returns" in q_lower)
+        and "365" in q_lower
+        and "signup" in q_lower
+    ):
+        return metrics_promos_coupons._es_coupon_returns_365d_since_signup(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: Segmentation / Pricing / Route vs Retail / Tiers
+    # ============================================================
+
+    # Customer Value Tiers
+    if (
+        "customer value tiers" in q_lower
+        or ("value tiers" in q_lower and "customer" in q_lower)
+        or ("tier 1" in q_lower and "tier 2" in q_lower and "tier 3" in q_lower)
+        or ("top 5%" in q_lower and "next 15%" in q_lower and "tier" in q_lower)
+        or ("tiers" in q_lower and "p80" in q_lower and "p95" in q_lower)
+    ):
+        return metrics_lifecycle._es_customer_value_tiers(req, client, mappings, business_rules)
+
+    # Route vs Retail Comparison
+    if (
+        "route vs retail" in q_lower
+        or "retail vs route" in q_lower
+        or ("route" in q_lower and "retail" in q_lower and ("compare" in q_lower or "comparison" in q_lower))
+        or ("route customers" in q_lower and "retail" in q_lower)
+    ):
+        return metrics_lifecycle._es_route_vs_retail_comparison(req, client, mappings, business_rules)
+
+    # Price Segments by Average Visit Value
+    if (
+        "price segments" in q_lower
+        or "pricing segments" in q_lower
+        or ("average visit value" in q_lower and ("segments" in q_lower or "segment" in q_lower))
+        or ("visit_average_sales" in q_lower and ("segments" in q_lower or "segment" in q_lower))
+        or ("under $25" in q_lower and "over $75" in q_lower)
+    ):
+        return metrics_lifecycle._es_price_segments_by_avg_visit_value(req, client, mappings, business_rules)
+
+    # ✅ NEW: High-Value Retail Targets (moved here)
+    if (
+        "high-value retail" in q_lower
+        or "high value retail" in q_lower
+        or ("retail" in q_lower and "targets" in q_lower)
+        or ("route conversion" in q_lower and "retail" in q_lower)
+        or ("high" in q_lower and "value" in q_lower and "retail" in q_lower and "targets" in q_lower)
+    ):
+        return metrics_lifecycle._es_high_value_retail_targets(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: Churn / Recency distribution
+    # ============================================================
+
+    # Churn Rate
+    if (
+        "churn rate" in q_lower
+        or ("churn" in q_lower and "rate" in q_lower)
+        or ("churned" in q_lower and "customers" in q_lower)
+    ):
+        return metrics_lifecycle._es_churn_rate(req, client, mappings, business_rules)
+
+    # Days Since Last Visit Distribution
+    if (
+        "days since last visit" in q_lower
+        or ("last visit" in q_lower and "distribution" in q_lower)
+        or ("recency" in q_lower and "distribution" in q_lower)
+        or ("0–30" in q_lower and "31–60" in q_lower and "91–180" in q_lower)
+        or ("0-30" in q_lower and "31-60" in q_lower and "91-180" in q_lower)
+    ):
+        return metrics_lifecycle._es_days_since_last_visit_distribution(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: lifecycle rate / interval / repeat metrics
+    # ============================================================
+
+    # Active Customer Rate (%)
+    if (
+        ("active customer rate" in q_lower or ("active rate" in q_lower and "customer" in q_lower))
+        and "30" not in q_lower  # avoid confusion with 30d activity rate
+    ):
+        return metrics_lifecycle._es_active_customer_rate(req, client, mappings, business_rules)
+
+    # 30-Day Activity Rate (%)
+    if (
+        "30-day activity rate" in q_lower
+        or "30 day activity rate" in q_lower
+        or ("30" in q_lower and "activity rate" in q_lower)
+        or ("activity rate" in q_lower and "30" in q_lower)
+    ):
+        return metrics_lifecycle._es_30d_activity_rate(req, client, mappings, business_rules)
+
+    # Average Visit Interval (days)
+    if (
+        "average visit interval" in q_lower
+        or "avg visit interval" in q_lower
+        or ("visit interval" in q_lower and ("average" in q_lower or "avg" in q_lower))
+    ):
+        return metrics_lifecycle._es_avg_visit_interval(req, client, mappings, business_rules)
+
+    # Repeat Customers (365 days)
+    if (
+        "repeat customers 365" in q_lower
+        or "repeat customer 365" in q_lower
+        or ("repeat customers" in q_lower and "365" in q_lower)
+        or ("repeat rate" in q_lower and "365" in q_lower)
+    ):
+        return metrics_lifecycle._es_repeat_customers_365(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: Visit Frequency charts
+    # ============================================================
+
+    # Visit Frequency – 365 Days
+    if (
+        "visit frequency 365" in q_lower
+        or "visit frequency – 365" in q_lower
+        or "visit frequency - 365" in q_lower
+        or ("visit frequency" in q_lower and "365" in q_lower)
+        or ("distribution" in q_lower and "visits_365" in q_lower)
+    ):
+        return metrics_lifecycle._es_visit_frequency_365(req, client, mappings, business_rules)
+
+    # Visit Frequency – 730 Days
+    if (
+        "visit frequency 730" in q_lower
+        or "visit frequency – 730" in q_lower
+        or "visit frequency - 730" in q_lower
+        or ("visit frequency" in q_lower and "730" in q_lower)
+        or ("distribution" in q_lower and "visits_lifetime" in q_lower and ("730" in q_lower or "2 year" in q_lower))
+    ):
+        return metrics_lifecycle._es_visit_frequency_730(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: Pareto + Single-Visit metrics
+    # ============================================================
+
+    # Pareto 80/20
+    if (
+        "pareto" in q_lower
+        or "80/20" in q_lower
+        or ("80" in q_lower and "20" in q_lower and "rule" in q_lower)
+        or ("percentage of customers" in q_lower and "80" in q_lower and "revenue" in q_lower)
+    ):
+        return metrics_lifecycle._es_pareto_80_20(req, client, mappings, business_rules)
+
+    # Single Visit (Lifetime) %
+    if (
+        "single visit lifetime" in q_lower
+        or "single-visit lifetime" in q_lower
+        or ("single visit" in q_lower and "lifetime" in q_lower)
+        or ("one visit" in q_lower and "lifetime" in q_lower)
+    ):
+        return metrics_lifecycle._es_single_visit_lifetime(req, client, mappings, business_rules)
+
+    # Single Visit (365 days) %
+    if (
+        "single visit 365" in q_lower
+        or "single-visit 365" in q_lower
+        or ("single visit" in q_lower and "365" in q_lower)
+        or ("one visit" in q_lower and "365" in q_lower)
+        or ("single visit" in q_lower and "last year" in q_lower)
+    ):
+        return metrics_lifecycle._es_single_visit_365(req, client, mappings, business_rules)
+
+    # ============================================================
+    # ✅ NEW: Acquisition / YoY / Cohort (customers index)
+    # ============================================================
+
+    # Daily Acquisition Rate by Period (last 180 days)
+    if (
+        "daily acquisition rate" in q_lower
+        or ("acquisition rate" in q_lower and "daily" in q_lower)
+        or ("acquisition" in q_lower and "0–30" in q_lower and "30–60" in q_lower)
+        or ("acquisition" in q_lower and "0-30" in q_lower and "30-60" in q_lower)
+        or ("first_visit" in q_lower and "180" in q_lower and "days" in q_lower)
+    ):
+        return metrics_lifecycle._es_daily_acquisition_rate_by_period_customers(
+            req, client, mappings, business_rules
+        )
+
+    # YoY New Customers (customers index)
+    if (
+        ("year-over-year" in q_lower or "year over year" in q_lower or "yoy" in q_lower)
+        and ("new customers" in q_lower or ("new" in q_lower and "customers" in q_lower))
+    ):
+        return metrics_lifecycle._es_yoy_new_customers_customers_index(req, client, mappings, business_rules)
+
+    # ✅ NEW: Return Rate by Cohort Year (moved here + stronger triggers)
+    if (
+        "return rate by cohort" in q_lower
+        or "cohort return rate" in q_lower
+        or ("return rate" in q_lower and "cohort" in q_lower)
+        or ("cohort" in q_lower and "year" in q_lower and "return" in q_lower)
+        or ("cohort" in q_lower and "year" in q_lower)
+    ):
+        return metrics_lifecycle._es_return_rate_by_cohort_year_customers(
+            req, client, mappings, business_rules
+        )
+
+    # ============================================================
+    # Existing lifecycle/time-series routes (existing)
+    # ============================================================
+
+    if ("top 20%" in q_lower and "overdue" in q_lower and "customer" in q_lower):
+        return metrics_lifecycle._es_top20_customers_overdue_14d(req, client, mappings, business_rules)
+
+    # Active Customers (count) — keep this AFTER "active customer rate" rule
+    if (
+        "active customers" in q_lower
+        and "active customer rate" not in q_lower
+        and "average days between visits" not in q_lower
+        and "avg days between visits" not in q_lower
+    ):
+        return metrics_lifecycle._es_active_customers(req, client, mappings, business_rules)
+
+    if (
+        ("retention rate" in q_lower or "customer retention" in q_lower)
+        and ("730" in q_lower or "2 year" in q_lower or "two year" in q_lower)
+        and ("180" in q_lower or "6 month" in q_lower or "six month" in q_lower)
+    ):
+        return metrics_lifecycle._es_customer_retention_rate_730_180(req, client, mappings, business_rules)
+
+    if ("retention" in q_lower) and ("730" in q_lower) and ("180" in q_lower):
+        return metrics_lifecycle._es_customer_retention_rate_730_180(req, client, mappings, business_rules)
+
+    if (
+        "average customer lifespan" in q_lower
+        or "avg customer lifespan" in q_lower
+        or ("customer lifespan" in q_lower and ("average" in q_lower or "avg" in q_lower))
+    ):
+        return metrics_lifecycle._es_avg_customer_lifespan(req, client, mappings, business_rules)
 
     if "average days between visits" in q_lower and "active customers" in q_lower:
         return metrics_lifecycle._es_avg_days_between_visits_active(req, client, mappings, business_rules)
@@ -788,11 +1032,13 @@ def _route_es_special(
     if "lapsed customers" in q_lower or (">180 days" in q_lower and "last visit" in q_lower):
         return metrics_lifecycle._es_lapsed_customers(req, client, mappings, business_rules)
 
+    # Keep generic visit-frequency handler AFTER the explicit 365/730 ones
     if "distribution of customers by visit frequency" in q_lower or (
         "visit frequency" in q_lower and "1, 2–5, 6–11, 12+" in q_lower
     ):
         return metrics_lifecycle._es_visit_frequency_distribution(req, client, mappings, business_rules)
 
+    # Keep top-customers-by-revenue AFTER Pareto
     if (
         ("top 5%" in q_lower and "top 20%" in q_lower and "revenue" in q_lower)
         or ("top 5 percent" in q_lower and "top 20 percent" in q_lower and "revenue" in q_lower)
@@ -800,6 +1046,7 @@ def _route_es_special(
         or ("top 20%" in q_lower and "revenue" in q_lower)
         or ("top 20 percent" in q_lower and "revenue" in q_lower)
         or ("percentage of revenue comes from the top 20%" in q_lower)
+        or ("percentage of revenue comes from the top 20 percent" in q_lower)
     ):
         return metrics_lifecycle._es_top_customers_by_revenue(req, client, mappings, business_rules)
 
@@ -843,14 +1090,6 @@ def _route_es_special(
         return metrics_lifecycle._es_customers_nth_visit(req, client, mappings, business_rules)
 
     if (
-        "coupon" in q_lower
-        and ("return" in q_lower or "returns" in q_lower)
-        and "365" in q_lower
-        and "signup" in q_lower
-    ):
-        return metrics_promos_coupons._es_coupon_returns_365d_since_signup(req, client, mappings, business_rules)
-
-    if (
         ("year-over-year" in q_lower or "year over year" in q_lower or "yoy" in q_lower)
         and "revenue" in q_lower
         and "location" in q_lower
@@ -858,7 +1097,6 @@ def _route_es_special(
         return metrics_time_series._es_yoy_revenue_by_location(req, client, mappings, business_rules)
 
     return None
-
 
 # -------------------------------------------------------------------
 # ES path: question -> (special ES or DSL) -> ES -> rows
@@ -929,8 +1167,8 @@ def _ask_via_es(req: DocsAnalyticsRequest):
 
     index_to_use = index_from_dsl or chosen_index
 
-    # ✅ SAFETY: sanitize + enforce window on LLM DSL queries
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date")
+    # ✅ SAFETY: sanitize + enforce window on LLM DSL queries (DIRECT FIELD)
+    date_field = INVOICE_FIELDS["date"] if _field_exists(mappings, INVOICE_FIELDS["date"]) else None
     body = _sanitize_es_body_for_prod(req, body, date_field=date_field)
 
     try:
@@ -1097,6 +1335,8 @@ def es_dashboard(req: MetricsDashboardRequest):
         ),
         "metrics": [m.model_dump() for m in metrics],
     }
+
+
 # -------------------------------------------------------------------
 # Analytics endpoint (router)
 # -------------------------------------------------------------------

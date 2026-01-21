@@ -8,7 +8,6 @@ from abi.runtime import to_json_safe
 from routes.es_test import _extract_properties_from_mapping
 
 from app.api.docs_analytics_routes import (
-    resolve_es_field,
     _ms_to_dt,
     _parse_date_str,
     _es_cannot_answer,
@@ -16,6 +15,40 @@ from app.api.docs_analytics_routes import (
     _select_invoice_index_from_es_mapping,
     _es_get_customer_stats,
 )
+
+# -------------------------------------------------------------------
+# ✅ NEW: mapping-aware field existence helper (prevents silent 0 results)
+# -------------------------------------------------------------------
+
+def _field_exists(mappings: Dict[str, Any], dotted: str) -> bool:
+    """
+    True only if 'dotted' exists in mappings (supports multi-fields like *.keyword).
+    Expected mappings shape: {"properties": {...}}.
+    """
+    if not dotted:
+        return False
+
+    node: Any = mappings or {}
+    parts = dotted.split(".")
+
+    for part in parts:
+        if not isinstance(node, dict):
+            return False
+
+        props = node.get("properties") or {}
+        if part in props:
+            node = props[part] or {}
+            continue
+
+        fields = node.get("fields") or {}
+        if part in fields:
+            node = fields[part] or {}
+            continue
+
+        return False
+
+    return True
+
 
 # -------------------------------------------------------------------
 # ✅ NEW: small coercion helpers (so dashboard shows 0.0 instead of null/—)
@@ -64,7 +97,7 @@ def _metric_value_from_rows(resp: Dict[str, Any], metric_id: str) -> Optional[fl
     for r in rows:
         if isinstance(r, dict) and r.get("metric") == metric_id:
             v = r.get("value")
-            # ✅ MODIFIED: accept numeric strings too
+            # ✅ accept numeric strings too
             if isinstance(v, (int, float)):
                 return float(v)
             if isinstance(v, str):
@@ -395,7 +428,6 @@ def _customer_ltv_from_invoices_composite(
 # -------------------------------------------------------------------
 # Core visit metrics (lifetime) - invoices only
 # -------------------------------------------------------------------
-
 def _es_core_visit_metrics(
     req,
     client,
@@ -404,61 +436,87 @@ def _es_core_visit_metrics(
 ):
     """
     Core visit KPIs for the dashboard (LIFETIME / ALL HISTORY)
+
+    ✅ Customers index ONLY (fast)
+    ❌ No invoice fallback
     """
-    invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
-    properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
-    invoice_mappings = {"properties": properties}
-
-    stats = _es_get_customer_stats(client, invoice_index, invoice_mappings)
-
-    if stats is None or not stats:
+    cust_index = (getattr(req, "es_customers_index_name", None) or "").strip()
+    if not cust_index:
         return _es_cannot_answer(
-            "Cannot compute core visit metrics because customer/date fields "
-            "could not be resolved from the Elasticsearch mappings or no customers "
-            "with visits were found.",
+            "Cannot compute core lifetime metrics: es_customers_index_name is not configured on the request.",
             business_rules,
         )
 
-    total_visit_amount = 0.0
-    total_visit_pieces = 0.0
-    total_visits = 0
-    unique_customers = 0
-    any_pieces = False
+    # fetch customers mappings
+    try:
+        full_mapping = client.indices.get_mapping(index=cust_index)
+    except Exception as e:
+        return _es_cannot_answer(
+            f"Cannot compute core lifetime metrics: failed to fetch mappings for customers index '{cust_index}': {e}",
+            business_rules,
+        )
 
-    for s in stats:
-        unique_customers += 1
-        vc = s.get("visit_count") or 0
-        total_visits += vc
+    index_names = sorted(full_mapping.keys())
+    if not index_names:
+        return _es_cannot_answer(
+            f"Cannot compute core lifetime metrics: no indices found for pattern '{cust_index}'.",
+            business_rules,
+        )
 
-        tr = s.get("total_revenue")
-        if tr is not None:
-            total_visit_amount += float(tr)
+    chosen = index_names[0]
+    cust_props = ((full_mapping[chosen].get("mappings") or {}).get("properties")) or {}
+    cust_mappings = {"properties": cust_props}
 
-        tp = s.get("total_pieces")
-        if tp is not None:
-            total_visit_pieces += float(tp)
-            any_pieces = True
+    # required rollup fields in your customers mapping
+    required = ["customer_id", "visits_lifetime", "sales_pickup_lifetime"]
+    missing = [f for f in required if not _field_exists(cust_mappings, f)]
+    if missing:
+        return _es_cannot_answer(
+            "Cannot compute core lifetime metrics from customers index because required fields "
+            f"are missing from mappings: {', '.join(missing)}. "
+            "Expected fields: customer_id, visits_lifetime, sales_pickup_lifetime.",
+            business_rules,
+        )
 
-    pieces_value = total_visit_pieces if any_pieces else None
+    body: Dict[str, Any] = {
+        "size": 0,
+        "request_cache": True,  # good for “all-time” totals
+        "aggs": {
+            "unique_customers": {"cardinality": {"field": "customer_id"}},
+            "total_visits": {"sum": {"field": "visits_lifetime"}},
+            "total_visit_amount": {"sum": {"field": "sales_pickup_lifetime"}},
+        },
+    }
+
+    try:
+        res = _safe_es_search(client, index=chosen, body=body)
+    except Exception as e:
+        return _es_cannot_answer(
+            f"Error executing customers-index aggregation on '{chosen}': {e}",
+            business_rules,
+        )
+
+    agg = (res.get("aggregations") or {})
+
+    unique_customers = int((agg.get("unique_customers") or {}).get("value") or 0)
+    total_visits = float((agg.get("total_visits") or {}).get("value") or 0.0)
+    total_visit_amount = float((agg.get("total_visit_amount") or {}).get("value") or 0.0)
+
+    # Customers mapping does NOT have lifetime pieces (only averages) → null
+    total_visit_pieces = None
 
     rows: List[Dict[str, Any]] = [
         {"metric": "total_visit_amount", "label": "Total Visit Amount", "value": total_visit_amount},
-        {"metric": "total_visit_pieces", "label": "Total Visit Pieces", "value": pieces_value},
+        {"metric": "total_visit_pieces", "label": "Total Visit Pieces", "value": total_visit_pieces},
         {"metric": "total_visits", "label": "Total Visits", "value": total_visits},
         {"metric": "unique_customers", "label": "Unique Customers", "value": unique_customers},
     ]
 
     insight = (
-        f"Core visit metrics were computed directly on Elasticsearch index '{invoice_index}' "
-        f"using per-customer visit statistics. "
+        f"Core lifetime metrics were computed from customers rollups on index '{chosen}' "
+        f"using sum(visits_lifetime) and sum(sales_pickup_lifetime). "
+        f"Total Visit Pieces is not available because the customers index does not store lifetime pieces totals."
     )
-    if pieces_value is None:
-        insight += (
-            "No suitable 'pieces' field could be found in the index mappings, so "
-            "Total Visit Pieces is not available (value is null)."
-        )
-    else:
-        insight += "Total Visit Pieces is the sum of per-customer piece counts based on the resolved pieces field."
 
     return {
         "insight": to_json_safe(insight),
@@ -466,7 +524,6 @@ def _es_core_visit_metrics(
         "rules_used": business_rules or "",
         "engine": "es",
     }
-
 
 # -------------------------------------------------------------------
 # Windowed customer-value metrics (per period)
@@ -480,6 +537,9 @@ def _es_customer_value_metrics(
 ):
     """
     Windowed customer value metrics for the selected period (invoices index).
+
+    ✅ MODIFIED: use direct mapping fields (no resolve_es_field)
+      - customer_id, dropoff_at, total, pieces, visit_id
     """
     invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
     index_name = invoice_index
@@ -487,18 +547,21 @@ def _es_customer_value_metrics(
     properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
     invoice_mappings = {"properties": properties}
 
-    customer_field = resolve_es_field(invoice_mappings, user_term="customer_id", alias_family="customer")
-    date_field = resolve_es_field(invoice_mappings, user_term="dropoff_at", alias_family="date")
-    amount_field = resolve_es_field(invoice_mappings, user_term="total", alias_family="amount")
-    pieces_field = resolve_es_field(invoice_mappings, user_term="pieces", alias_family="pieces")
-    visit_field = resolve_es_field(invoice_mappings, user_term="visit_id", alias_family="visit")
+    # ✅ MODIFIED PART START ---------------------------------------------
+    customer_field = "customer_id"
+    date_field = "dropoff_at"
+    amount_field = "total"
 
-    if not (customer_field and date_field and amount_field):
+    pieces_field = "pieces" if _field_exists(invoice_mappings, "pieces") else None
+    visit_field = "visit_id" if _field_exists(invoice_mappings, "visit_id") else None
+
+    if not (_field_exists(invoice_mappings, customer_field) and _field_exists(invoice_mappings, date_field) and _field_exists(invoice_mappings, amount_field)):
         return _es_cannot_answer(
-            "Cannot compute customer value metrics because customer, date or amount "
-            "fields could not be resolved from the Elasticsearch mappings.",
+            "Cannot compute customer value metrics because one of the required fields "
+            "is missing from the invoices index mapping: customer_id, dropoff_at, total.",
             business_rules,
         )
+    # ✅ MODIFIED PART END -----------------------------------------------
 
     filters = _build_date_range_filter(req, date_field)
 
@@ -525,7 +588,7 @@ def _es_customer_value_metrics(
     unique_customers = int((agg.get("unique_customers") or {}).get("value") or 0)
     total_revenue = float((agg.get("total_revenue") or {}).get("value") or 0.0)
 
-    # ✅ MODIFIED: always provide a numeric total_pieces (0.0 if missing)
+    # ✅ always provide numeric total_pieces (0.0 if missing)
     if "total_pieces" in agg:
         total_pieces = float((agg["total_pieces"] or {}).get("value") or 0.0)
     else:
@@ -533,7 +596,7 @@ def _es_customer_value_metrics(
 
     total_visits = int((agg.get("total_visits") or {}).get("value") or 0)
 
-    # ✅ MODIFIED: dashboard prefers 0.0 instead of null when there is no data
+    # ✅ dashboard prefers 0.0 instead of null when there is no data
     if unique_customers > 0:
         avg_visits_per_customer = total_visits / float(unique_customers)
         revenue_per_customer = total_revenue / float(unique_customers)
@@ -597,13 +660,12 @@ def _window_customer_value_metrics(
     ✅ MODIFIED:
       - Always return ALL dashboard metric keys
       - Never return None for numeric KPIs (use 0.0 instead)
-      - Broaden metric id extraction for some helpers
+      - Use invoice mappings extracted from the selected invoice index for downstream ES metrics
     """
     req = deepcopy(base_req)
     req.start_date = period.start_date
     req.end_date = period.end_date
 
-    # ✅ these are the metric ids your /docs/dashboard label_map expects
     expected_metric_ids = [
         "total_visits",
         "unique_customers",
@@ -627,23 +689,22 @@ def _window_customer_value_metrics(
         "coupon_returns_365d_since_signup",
     ]
 
-    # ✅ initialize everything to 0.0 so frontend always displays a number
     values: Dict[str, Optional[float]] = {k: 0.0 for k in expected_metric_ids}
 
-    # ---- core windowed metrics ----
-    resp = _es_customer_value_metrics(req=req, client=client, mappings=mappings, business_rules=None)
+    # ✅ MODIFIED: always use extracted invoice mappings for any invoice-based ES metric
+    invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
+    invoice_props = _extract_properties_from_mapping(invoice_mapping, invoice_index)
+    invoice_mappings = {"properties": invoice_props}
 
+    # ---- core windowed metrics ----
+    resp = _es_customer_value_metrics(req=req, client=client, mappings=invoice_mappings, business_rules=None)
     for r in (resp.get("rows") or []):
         if isinstance(r, dict) and r.get("metric") is not None:
             mid = str(r["metric"])
-            if mid in values:
-                values[mid] = _as_float(r.get("value"), 0.0)
-            else:
-                # keep extra metrics too (if ever needed)
-                values[mid] = _as_float(r.get("value"), 0.0)
+            values[mid] = _as_float(r.get("value"), 0.0)
 
     # ----- initial visit totals (amount / pieces) -----
-    init_vals = _es_initial_visit_totals(req, client, mappings) or {}
+    init_vals = _es_initial_visit_totals(req, client, invoice_mappings) or {}
     values["initial_visit_amount"] = _as_float(init_vals.get("initial_visit_amount"), 0.0)
     values["initial_visit_pieces"] = _as_float(init_vals.get("initial_visit_pieces"), 0.0)
 
@@ -656,7 +717,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "Average Pickup Delay (Retail)"
         delay_resp = metrics_promos_coupons._es_avg_pickup_delay_retail(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         delay_val = _metric_value_from_rows_any(
             delay_resp,
@@ -675,7 +736,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "Invoices with Redo Items"
         redo_resp = metrics_promos_coupons._es_invoices_with_redo_items(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         redo_val = _metric_value_from_rows_any(
             redo_resp,
@@ -694,7 +755,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "New Customer Acquisition"
         new_cust_resp = metrics_lifecycle._es_new_customer_acquisition(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         s = _sum_field_from_rows(new_cust_resp, "new_customers")
         if s is None:
@@ -707,7 +768,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "New Customer 30-Day Return Rate"
         r30_resp = metrics_lifecycle._es_new_customer_30d_return_rate(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         r30_val = _metric_value_from_rows_any(
             r30_resp,
@@ -726,7 +787,7 @@ def _window_customer_value_metrics(
     def _nth_value_for(question: str) -> float:
         window_req.question = question
         resp2 = metrics_lifecycle._es_customers_nth_visit(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
 
         v = _metric_value_from_rows_any(
@@ -767,7 +828,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "Top 20% Customers – Redo / Courtesy Issues"
         top20_resp = metrics_promos_coupons._es_top20_customers_with_redo_courtesy(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         values["top20_customers_redo_issues"] = _as_float(_count_rows(top20_resp), 0.0)
     except Exception:
@@ -777,7 +838,7 @@ def _window_customer_value_metrics(
     try:
         window_req.question = "Coupon Returns – First Coupon Visit 365+ Days After Signup"
         coupon_resp = metrics_promos_coupons._es_coupon_returns_365d_since_signup(
-            window_req, client, mappings, business_rules=None
+            window_req, client, invoice_mappings, business_rules=None
         )
         values["coupon_returns_365d_since_signup"] = _as_float(_count_rows(coupon_resp), 0.0)
     except Exception:
@@ -801,6 +862,9 @@ def _es_initial_visit_totals(
 ) -> Dict[str, Optional[float]]:
     """
     Initial Visit – Amount / Pieces (windowed)
+
+    ✅ MODIFIED: use direct mapping fields (no resolve_es_field)
+      - customer_id, dropoff_at, total, pieces, visit_id
     """
     try:
         invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
@@ -810,14 +874,17 @@ def _es_initial_visit_totals(
     properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
     invoice_mappings = {"properties": properties}
 
-    customer_field = resolve_es_field(invoice_mappings, user_term="customer_id", alias_family="customer")
-    date_field = resolve_es_field(invoice_mappings, user_term="dropoff_at", alias_family="date")
-    amount_field = resolve_es_field(invoice_mappings, user_term="total", alias_family="amount")
-    pieces_field = resolve_es_field(invoice_mappings, user_term="pieces", alias_family="pieces")
-    visit_field = resolve_es_field(invoice_mappings, user_term="visit_id", alias_family="visit")
+    # ✅ MODIFIED PART START ---------------------------------------------
+    customer_field = "customer_id"
+    date_field = "dropoff_at"
+    amount_field = "total"
+    visit_field = "visit_id"
+    pieces_field = "pieces" if _field_exists(invoice_mappings, "pieces") else None
 
-    if not (customer_field and date_field and amount_field and visit_field):
+    required = [customer_field, date_field, amount_field, visit_field]
+    if not all(_field_exists(invoice_mappings, f) for f in required):
         return {"initial_visit_amount": None, "initial_visit_pieces": None}
+    # ✅ MODIFIED PART END -----------------------------------------------
 
     try:
         return _initial_visit_totals_from_invoices_composite(
@@ -828,7 +895,7 @@ def _es_initial_visit_totals(
             visit_field=visit_field,
             date_field=date_field,
             amount_field=amount_field,
-            pieces_field=pieces_field if pieces_field else None,
+            pieces_field=pieces_field,
         )
     except Exception:
         return {"initial_visit_amount": None, "initial_visit_pieces": None}
@@ -846,6 +913,9 @@ def _es_customer_ltv(
 ):
     """
     Average customer lifetime value (average customer spend).
+
+    ✅ MODIFIED: use direct mapping fields (no resolve_es_field)
+      - customer_id, total
     """
     try:
         invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
@@ -858,15 +928,17 @@ def _es_customer_ltv(
     properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
     invoice_mappings = {"properties": properties}
 
-    customer_field = resolve_es_field(invoice_mappings, user_term="customer_id", alias_family="customer")
-    amount_field = resolve_es_field(invoice_mappings, user_term="total", alias_family="amount")
+    # ✅ MODIFIED PART START ---------------------------------------------
+    customer_field = "customer_id"
+    amount_field = "total"
 
-    if not (customer_field and amount_field):
+    if not (_field_exists(invoice_mappings, customer_field) and _field_exists(invoice_mappings, amount_field)):
         return _es_cannot_answer(
-            "Cannot compute 'average customer lifetime value' on this Elasticsearch index "
-            "because customer or amount fields could not be found in the mappings.",
+            "Cannot compute 'average customer lifetime value' because required fields "
+            "customer_id and/or total are missing from the invoices mapping.",
             business_rules,
         )
+    # ✅ MODIFIED PART END -----------------------------------------------
 
     try:
         out = _customer_ltv_from_invoices_composite(
@@ -898,9 +970,26 @@ def _es_one_time_vs_repeat(
 ):
     """
     One-time vs repeat customers (invoices-only).
+
+    ✅ MODIFIED:
+      - Always select the invoice index + extract invoice mappings
+      - Avoid passing possibly-wrong 'mappings' from caller
     """
-    index_name = req.es_index_name.strip()
-    stats = _es_get_customer_stats(client, index_name, mappings)
+    # ✅ MODIFIED PART START ---------------------------------------------
+    try:
+        invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
+    except Exception:
+        return _es_cannot_answer(
+            "Cannot compute 'one-time vs repeat customers' because invoice index could not be selected.",
+            business_rules,
+        )
+
+    properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
+    invoice_mappings = {"properties": properties}
+
+    stats = _es_get_customer_stats(client, invoice_index, invoice_mappings)
+    # ✅ MODIFIED PART END -----------------------------------------------
+
     if stats is None:
         return _es_cannot_answer(
             "Cannot compute 'one-time vs repeat customers' because customer or date fields "

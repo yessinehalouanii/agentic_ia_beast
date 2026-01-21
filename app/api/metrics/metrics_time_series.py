@@ -4,12 +4,69 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Iterable
 
 from abi.runtime import to_json_safe
+from app.api.metrics.metrics_promos_coupons import _date_filters_or_default
+from routes.es_test import _extract_properties_from_mapping
+
 from app.api.docs_analytics_routes import (
-    resolve_es_field,
     _ms_to_dt,
     _es_cannot_answer,
     _build_date_range_filter,
+    _select_invoice_index_from_es_mapping,
 )
+
+# -------------------------------------------------------------------
+# Mapping helpers (NO resolver / exact field names)
+# -------------------------------------------------------------------
+
+def _field_exists(mappings: Dict[str, Any], dotted: str) -> bool:
+    """
+    True only if 'dotted' exists in mappings (supports multi-fields like *.keyword).
+    Expected mappings shape: {"properties": {...}}.
+    """
+    if not dotted:
+        return False
+
+    node: Any = mappings or {}
+    parts = dotted.split(".")
+
+    for part in parts:
+        if not isinstance(node, dict):
+            return False
+
+        props = node.get("properties") or {}
+        if part in props:
+            node = props[part] or {}
+            continue
+
+        fields = node.get("fields") or {}
+        if part in fields:
+            node = fields[part] or {}
+            continue
+
+        return False
+
+    return True
+
+
+def _pick_keyword_or_base(mappings: Dict[str, Any], base: str) -> Optional[str]:
+    """
+    Prefer base.keyword if it exists, else base if it exists, else None.
+    """
+    kw = f"{base}.keyword"
+    if _field_exists(mappings, kw):
+        return kw
+    if _field_exists(mappings, base):
+        return base
+    return None
+
+
+def _get_invoice_index_and_mappings(client, es_index_name: str) -> tuple[str, Dict[str, Any]]:
+    """
+    Resolve the real invoices index (handles aliases) and extract its properties mapping.
+    """
+    invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, es_index_name)
+    props = _extract_properties_from_mapping(invoice_mapping, invoice_index)
+    return invoice_index, {"properties": props}
 
 
 # -------------------------------------------------------------------
@@ -68,14 +125,6 @@ def _composite_buckets(
 ) -> Iterable[Dict[str, Any]]:
     """
     Composite aggregation paginator with safety caps.
-
-    - max_pages: hard cap on number of composite requests
-    - max_buckets: hard cap on total buckets yielded
-
-    If capped, sets:
-      state["truncated"] = True
-      state["pages"] = <int>
-      state["buckets"] = <int>
     """
     if state is None:
         state = {}
@@ -138,30 +187,28 @@ def _es_month_over_month_visits(
     """
     Month-over-month visit volume trend based on ES date_histogram by month.
 
-    Safety changes:
-      - If no window is provided, defaults to last ~13 months.
-      - Uses visit_id.keyword if available.
-      - Adds low-ish cardinality precision_threshold to reduce memory.
+    ✅ Uses direct fields:
+      - dropoff_at
+      - visit_id(.keyword) if present (else falls back to doc_count)
     """
-    index_name = (req.es_index_name or "").strip()
-    if not index_name:
+    index_in = (req.es_index_name or "").strip()
+    if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date")
-    if not date_field:
+    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
+
+    date_field = "dropoff_at"
+    if not _field_exists(idx_mappings, date_field):
         return _es_cannot_answer(
-            "Cannot compute month-over-month visits because no date field could be resolved.",
+            "Cannot compute month-over-month visits because required field 'dropoff_at' is missing from the invoices mapping.",
             business_rules,
         )
 
-    visit_field = (
-        resolve_es_field(mappings, user_term="visit_id.keyword", alias_family="visit")
-        or resolve_es_field(mappings, user_term="visit_id", alias_family="visit")
-    )
+    visit_field = _pick_keyword_or_base(idx_mappings, "visit_id")
     has_visit_field = bool(visit_field)
 
-    # ✅ default window (prevents full-history scans)
-    reqw = _with_default_window(req, default_days=400)  # ~13 months
+    # ✅ default window (~13 months)
+    reqw = _with_default_window(req, default_days=400)
 
     filters = _build_date_range_filter(reqw, date_field) or []
     query = {"bool": {"filter": filters}} if filters else None
@@ -240,20 +287,23 @@ def _es_seasonal_revenue_patterns(
     business_rules: Optional[str],
 ):
     """
-    Seasonal revenue patterns vs last year using monthly date_histogram + sum(amount).
+    Seasonal revenue patterns vs last year using monthly date_histogram + sum(total).
 
-    Safety changes:
-      - If no window is provided, defaults to last ~26 months (enough for YoY seasonality).
+    ✅ Uses direct fields:
+      - dropoff_at
+      - total
     """
-    index_name = (req.es_index_name or "").strip()
-    if not index_name:
+    index_in = (req.es_index_name or "").strip()
+    if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date")
-    amount_field = resolve_es_field(mappings, user_term="total", alias_family="amount")
-    if not date_field or not amount_field:
+    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
+
+    date_field = "dropoff_at"
+    amount_field = "total"
+    if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
         return _es_cannot_answer(
-            "Cannot compute seasonal revenue patterns because date or amount fields could not be resolved.",
+            "Cannot compute seasonal revenue patterns because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
             business_rules,
         )
 
@@ -342,9 +392,7 @@ def _es_seasonal_revenue_patterns(
     total_prev = sum(r[f"revenue_{prev_year}"] for r in rows)
     total_curr = sum(r[f"revenue_{current_year}"] for r in rows)
     if total_prev == 0:
-        yoy_text = (
-            f"Total revenue in {current_year} was {total_curr:.2f}, while {prev_year} had no revenue."
-        )
+        yoy_text = f"Total revenue in {current_year} was {total_curr:.2f}, while {prev_year} had no revenue."
     else:
         delta_total = total_curr - total_prev
         pct_total = 100.0 * delta_total / total_prev
@@ -373,28 +421,26 @@ def _es_avg_ticket_size(
     """
     Average $ per visit by day of week / month of year.
 
-    Safety changes:
-      - If no window is provided, defaults to last 365 days (scripts can be CPU-heavy).
-      - Uses visit_id.keyword if available.
+    ✅ Uses direct fields:
+      - dropoff_at
+      - total
+      - visit_id(.keyword) if present (else fallback to invoice rows)
     """
-    index_name = (req.es_index_name or "").strip()
-    if not index_name:
+    index_in = (req.es_index_name or "").strip()
+    if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date") or resolve_es_field(
-        mappings, alias_family="date"
-    )
-    amount_field = resolve_es_field(mappings, user_term="total", alias_family="amount")
-    visit_field = (
-        resolve_es_field(mappings, user_term="visit_id.keyword", alias_family="visit")
-        or resolve_es_field(mappings, user_term="visit_id", alias_family="visit")
-    )
+    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
 
-    if not (date_field and amount_field):
+    date_field = "dropoff_at"
+    amount_field = "total"
+    if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
         return _es_cannot_answer(
-            "Cannot compute avg $ per visit because date or amount fields could not be resolved.",
+            "Cannot compute avg $ per visit because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
             business_rules,
         )
+
+    visit_field = _pick_keyword_or_base(idx_mappings, "visit_id")  # optional
 
     # ✅ default window (scripts run per-doc; avoid full-history)
     reqw = _with_default_window(req, default_days=365)
@@ -509,30 +555,29 @@ def _es_yoy_revenue_by_location(
     """
     Year-over-year revenue growth by location.
 
-    ✅ Major safety change:
-      - Uses composite over (location, year) instead of (location -> date_histogram),
-        which is typically much cheaper and streams well.
-
-    ✅ Additional safety:
-      - If no window is provided, defaults to ~26 months.
-      - Composite caps (max_pages/max_buckets) to prevent overload.
+    ✅ Uses direct fields:
+      - dropoff_at
+      - total
+      - location_id(.keyword) required
     """
-    index_name = (req.es_index_name or "").strip()
-    if not index_name:
+    index_in = (req.es_index_name or "").strip()
+    if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date")
-    amount_field = resolve_es_field(mappings, user_term="total", alias_family="amount")
+    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
 
-    loc_field = (
-        resolve_es_field(mappings, user_term="location_id.keyword", alias_family="location_id")
-        or resolve_es_field(mappings, user_term="location_id", alias_family="location_id")
-        or resolve_es_field(mappings, alias_family="location")
-    )
-
-    if not date_field or not amount_field or not loc_field:
+    date_field = "dropoff_at"
+    amount_field = "total"
+    if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
         return _es_cannot_answer(
-            "Cannot compute YoY revenue by location because date, amount, or location fields could not be resolved.",
+            "Cannot compute YoY revenue by location because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
+            business_rules,
+        )
+
+    loc_field = _pick_keyword_or_base(idx_mappings, "location_id")
+    if not loc_field:
+        return _es_cannot_answer(
+            "Cannot compute YoY revenue by location because required field 'location_id' (or 'location_id.keyword') is missing from the invoices mapping.",
             business_rules,
         )
 
@@ -540,14 +585,12 @@ def _es_yoy_revenue_by_location(
     reqw = _with_default_window(req, default_days=800)
     filters = _build_date_range_filter(reqw, date_field) or []
 
-    # composite sources: location + year (date_histogram)
     sources = [
         {"loc": {"terms": {"field": loc_field}}},
         {"year": {"date_histogram": {"field": date_field, "calendar_interval": "year"}}},
     ]
     sub_aggs = {"revenue": {"sum": {"field": amount_field}}}
 
-    # safety caps (allow overriding via req.* if you want)
     page_size = int(getattr(req, "composite_page_size", 800) or 800)
     max_pages = int(getattr(req, "composite_max_pages", 200) or 200)
     max_buckets = int(getattr(req, "composite_max_buckets", 200_000) or 200_000)
@@ -584,13 +627,11 @@ def _es_yoy_revenue_by_location(
         rev = float(((b.get("revenue") or {}).get("value")) or 0.0)
 
         if loc != current_loc:
-            # reset per-location streaming state
             current_loc = loc
             prev_year = year
             prev_rev = rev
             continue
 
-        # same location, next year bucket
         if prev_year is not None and prev_rev is not None:
             delta = rev - prev_rev
             pct = (delta * 100.0 / prev_rev) if prev_rev > 0 else None
@@ -641,10 +682,104 @@ def _es_yoy_revenue_by_location(
         },
     }
 
+def _es_dropoff_visits(
+    req,
+    client,
+    mappings: Dict[str, Any],  # invoices mapping: {"properties": ...}
+    business_rules: Optional[str],
+):
+    """
+    Dropoff Visits (Invoices)
+    - Windowed by: dropoff_at
+    - Definition: DISTINCT visits at drop-off time
+    - Implementation: cardinality(visit_id)  ✅ (approx, fast, 1 request)
+    - Extras:
+        - invoice_count: value_count(invoice_id)
+        - unique_customers: cardinality(customer_id)
+    - Always returns 1 metric row (0 when no data)
+    """
+
+    index_name = (getattr(req, "es_index_name", "") or "").strip()
+    if not index_name:
+        return _es_cannot_answer("Dropoff Visits requires invoices index (es_index_name).", business_rules)
+
+    date_field = "dropoff_at"
+    visit_id_field = "visit_id"
+    invoice_id_field = "invoice_id"
+    customer_id_field = "customer_id"
+
+    # ✅ Direct mapping checks (no resolve)
+    required = [date_field, visit_id_field, invoice_id_field, customer_id_field]
+    missing = [f for f in required if not _field_exists(mappings, f)]
+    if missing:
+        return _es_cannot_answer(
+            "Cannot compute Dropoff Visits because required invoices fields are missing: "
+            + ", ".join(missing),
+            business_rules,
+        )
+
+    # Default window = last DEFAULT_WINDOW_DAYS if user didn't pass start/end
+    filters, window_label = _date_filters_or_default(req, date_field)
+
+    # Basic safety: only count docs that have needed fields
+    filters.append({"exists": {"field": date_field}})
+    filters.append({"exists": {"field": visit_id_field}})
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            # ✅ Main metric: distinct visits (approximate, very fast)
+            "dropoff_visits": {
+                "cardinality": {
+                    "field": visit_id_field,
+                    # optional: you can omit this completely for default behavior
+                    # "precision_threshold": 40000,
+                }
+            },
+            # Extra context
+            "invoice_count": {"value_count": {"field": invoice_id_field}},
+            "unique_customers": {"cardinality": {"field": customer_id_field}},
+        },
+    }
+
+    res = _safe_es_search(client, index=index_name, body=body)
+    aggs = res.get("aggregations") or {}
+
+    visits = int((aggs.get("dropoff_visits") or {}).get("value") or 0)
+    invoices = int((aggs.get("invoice_count") or {}).get("value") or 0)
+    customers = int((aggs.get("unique_customers") or {}).get("value") or 0)
+
+    rows = [
+        {
+            "metric": "dropoff_visits",
+            "label": "Dropoff Visits",
+            "value": float(visits),
+            "invoice_count": invoices,
+            "unique_customers": customers,
+            "window": window_label,
+            "date_field": date_field,
+            "visit_id_field": visit_id_field,
+        }
+    ]
+
+    insight = (
+        f"Dropoff Visits is computed as DISTINCT invoices.{visit_id_field} "
+        f"over invoices.{date_field} in ({window_label}). "
+        "This uses Elasticsearch cardinality (approximate) for stable performance at scale."
+    )
+
+    return {
+        "insight": to_json_safe(insight),
+        "rows": to_json_safe(rows),
+        "rules_used": business_rules or "",
+        "engine": "es",
+    }
 
 __all__ = [
     "_es_month_over_month_visits",
     "_es_seasonal_revenue_patterns",
     "_es_avg_ticket_size",
     "_es_yoy_revenue_by_location",
+    "_es_dropoff_visits",
 ]
