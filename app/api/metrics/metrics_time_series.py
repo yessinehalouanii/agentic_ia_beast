@@ -6,7 +6,10 @@ from typing import Any, Dict, List, Optional, Iterable
 from abi.runtime import to_json_safe
 from app.api.metrics.metrics_promos_coupons import _date_filters_or_default
 from routes.es_test import _extract_properties_from_mapping
-
+from app.api.metrics.shared_utilities import (
+    _field_exists,
+    _safe_es_search,
+)
 from app.api.docs_analytics_routes import (
     _ms_to_dt,
     _es_cannot_answer,
@@ -17,37 +20,6 @@ from app.api.docs_analytics_routes import (
 # -------------------------------------------------------------------
 # Mapping helpers (NO resolver / exact field names)
 # -------------------------------------------------------------------
-
-def _field_exists(mappings: Dict[str, Any], dotted: str) -> bool:
-    """
-    True only if 'dotted' exists in mappings (supports multi-fields like *.keyword).
-    Expected mappings shape: {"properties": {...}}.
-    """
-    if not dotted:
-        return False
-
-    node: Any = mappings or {}
-    parts = dotted.split(".")
-
-    for part in parts:
-        if not isinstance(node, dict):
-            return False
-
-        props = node.get("properties") or {}
-        if part in props:
-            node = props[part] or {}
-            continue
-
-        fields = node.get("fields") or {}
-        if part in fields:
-            node = fields[part] or {}
-            continue
-
-        return False
-
-    return True
-
-
 def _pick_keyword_or_base(mappings: Dict[str, Any], base: str) -> Optional[str]:
     """
     Prefer base.keyword if it exists, else base if it exists, else None.
@@ -72,13 +44,6 @@ def _get_invoice_index_and_mappings(client, es_index_name: str) -> tuple[str, Di
 # -------------------------------------------------------------------
 # ES-safe helpers (timeout + pagination + safety caps)
 # -------------------------------------------------------------------
-
-def _safe_es_search(client, *, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    body = dict(body or {})
-    body.setdefault("timeout", "10s")
-    body.setdefault("track_total_hits", False)
-    return client.search(index=index, body=body, request_timeout=20)
-
 
 class _WindowReq:
     """
@@ -108,71 +73,6 @@ def _with_default_window(req: Any, *, default_days: int) -> Any:
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=default_days)
     return _WindowReq(req, start_date=start.isoformat(), end_date=today.isoformat())
-
-
-def _composite_buckets(
-    client,
-    *,
-    index: str,
-    query_filters: List[Dict[str, Any]],
-    sources: List[Dict[str, Any]],
-    sub_aggs: Dict[str, Any],
-    page_size: int = 1000,
-    agg_name: str = "groups",
-    state: Optional[Dict[str, Any]] = None,
-    max_pages: int = 200,
-    max_buckets: int = 200_000,
-) -> Iterable[Dict[str, Any]]:
-    """
-    Composite aggregation paginator with safety caps.
-    """
-    if state is None:
-        state = {}
-    state.setdefault("pages", 0)
-    state.setdefault("buckets", 0)
-    state.setdefault("truncated", False)
-
-    after_key = None
-
-    while True:
-        if state["pages"] >= max_pages:
-            state["truncated"] = True
-            break
-
-        comp: Dict[str, Any] = {"size": page_size, "sources": sources}
-        if after_key:
-            comp["after"] = after_key
-
-        body = {
-            "size": 0,
-            "query": {"bool": {"filter": query_filters}},
-            "aggs": {
-                agg_name: {
-                    "composite": comp,
-                    "aggs": sub_aggs,
-                }
-            },
-        }
-
-        res = _safe_es_search(client, index=index, body=body)
-        state["pages"] += 1
-
-        agg = (res.get("aggregations") or {}).get(agg_name) or {}
-        buckets = agg.get("buckets") or []
-        if not buckets:
-            break
-
-        for b in buckets:
-            if state["buckets"] >= max_buckets:
-                state["truncated"] = True
-                return
-            state["buckets"] += 1
-            yield b
-
-        after_key = agg.get("after_key")
-        if not after_key:
-            break
-
 
 # -------------------------------------------------------------------
 # Metrics
@@ -412,276 +312,6 @@ def _es_seasonal_revenue_patterns(
     }
 
 
-def _es_avg_ticket_size(
-    req,
-    client,
-    mappings: Dict[str, Any],
-    business_rules: Optional[str],
-):
-    """
-    Average $ per visit by day of week / month of year.
-
-    ✅ Uses direct fields:
-      - dropoff_at
-      - total
-      - visit_id(.keyword) if present (else fallback to invoice rows)
-    """
-    index_in = (req.es_index_name or "").strip()
-    if not index_in:
-        return _es_cannot_answer("Missing es_index_name.", business_rules)
-
-    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
-
-    date_field = "dropoff_at"
-    amount_field = "total"
-    if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
-        return _es_cannot_answer(
-            "Cannot compute avg $ per visit because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
-            business_rules,
-        )
-
-    visit_field = _pick_keyword_or_base(idx_mappings, "visit_id")  # optional
-
-    # ✅ default window (scripts run per-doc; avoid full-history)
-    reqw = _with_default_window(req, default_days=365)
-
-    filters = _build_date_range_filter(reqw, date_field) or []
-    query = {"bool": {"filter": filters}} if filters else None
-
-    if visit_field:
-        by_dow_aggs = {
-            "total_revenue": {"sum": {"field": amount_field}},
-            "visit_count": {"cardinality": {"field": visit_field, "precision_threshold": 4000}},
-        }
-        by_month_aggs = {
-            "total_revenue": {"sum": {"field": amount_field}},
-            "visit_count": {"cardinality": {"field": visit_field, "precision_threshold": 4000}},
-        }
-    else:
-        by_dow_aggs = {
-            "total_revenue": {"sum": {"field": amount_field}},
-            "visit_count": {"value_count": {"field": date_field}},
-        }
-        by_month_aggs = {
-            "total_revenue": {"sum": {"field": amount_field}},
-            "visit_count": {"value_count": {"field": date_field}},
-        }
-
-    body: Dict[str, Any] = {
-        "size": 0,
-        "aggs": {
-            "by_dow": {
-                "terms": {
-                    "script": {"source": f"doc['{date_field}'].value.dayOfWeek", "lang": "painless"},
-                    "size": 7,
-                    "order": {"_key": "asc"},
-                },
-                "aggs": by_dow_aggs,
-            },
-            "by_month": {
-                "terms": {
-                    "script": {"source": f"doc['{date_field}'].value.monthOfYear", "lang": "painless"},
-                    "size": 12,
-                    "order": {"_key": "asc"},
-                },
-                "aggs": by_month_aggs,
-            },
-        },
-    }
-    if query:
-        body["query"] = query
-
-    res = _safe_es_search(client, index=index_name, body=body)
-    aggs = res.get("aggregations", {}) or {}
-
-    dow_buckets = aggs.get("by_dow", {}).get("buckets", []) or []
-    month_buckets = aggs.get("by_month", {}).get("buckets", []) or []
-
-    DOW_NAMES = {1: "monday", 2: "tuesday", 3: "wednesday", 4: "thursday", 5: "friday", 6: "saturday", 7: "sunday"}
-    MONTH_NAMES = {1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun", 7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"}
-
-    rows: List[Dict[str, Any]] = []
-
-    for b in dow_buckets:
-        key = int(b.get("key", 0))
-        total_rev = float(((b.get("total_revenue") or {}).get("value")) or 0.0)
-        visits = float(((b.get("visit_count") or {}).get("value")) or 0.0)
-        avg_per_visit = (total_rev / visits) if visits > 0 else None
-        rows.append(
-            {
-                "dimension": "day_of_week",
-                "label": DOW_NAMES.get(key, str(key)),
-                "total_revenue": total_rev,
-                "visit_count": visits,
-                "avg_value_per_visit": avg_per_visit,
-            }
-        )
-
-    for b in month_buckets:
-        key = int(b.get("key", 0))
-        total_rev = float(((b.get("total_revenue") or {}).get("value")) or 0.0)
-        visits = float(((b.get("visit_count") or {}).get("value")) or 0.0)
-        avg_per_visit = (total_rev / visits) if visits > 0 else None
-        rows.append(
-            {
-                "dimension": "month_of_year",
-                "label": MONTH_NAMES.get(key, str(key)),
-                "total_revenue": total_rev,
-                "visit_count": visits,
-                "avg_value_per_visit": avg_per_visit,
-            }
-        )
-
-    insight = (
-        f"Average $ per visit computed on '{index_name}' by day-of-week and month-of-year. "
-        f"Uses '{date_field}' for dates and '{amount_field}' for amounts. "
-        f"One visit is treated as one distinct visit_id{' (fallback to invoice rows if visit_id missing)' if not visit_field else ''}."
-    )
-
-    return {
-        "insight": to_json_safe(insight),
-        "rows": to_json_safe(rows),
-        "rules_used": business_rules or "",
-        "engine": "es",
-    }
-
-
-def _es_yoy_revenue_by_location(
-    req,
-    client,
-    mappings: Dict[str, Any],
-    business_rules: Optional[str],
-):
-    """
-    Year-over-year revenue growth by location.
-
-    ✅ Uses direct fields:
-      - dropoff_at
-      - total
-      - location_id(.keyword) required
-    """
-    index_in = (req.es_index_name or "").strip()
-    if not index_in:
-        return _es_cannot_answer("Missing es_index_name.", business_rules)
-
-    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
-
-    date_field = "dropoff_at"
-    amount_field = "total"
-    if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
-        return _es_cannot_answer(
-            "Cannot compute YoY revenue by location because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
-            business_rules,
-        )
-
-    loc_field = _pick_keyword_or_base(idx_mappings, "location_id")
-    if not loc_field:
-        return _es_cannot_answer(
-            "Cannot compute YoY revenue by location because required field 'location_id' (or 'location_id.keyword') is missing from the invoices mapping.",
-            business_rules,
-        )
-
-    # ✅ default window (~26 months)
-    reqw = _with_default_window(req, default_days=800)
-    filters = _build_date_range_filter(reqw, date_field) or []
-
-    sources = [
-        {"loc": {"terms": {"field": loc_field}}},
-        {"year": {"date_histogram": {"field": date_field, "calendar_interval": "year"}}},
-    ]
-    sub_aggs = {"revenue": {"sum": {"field": amount_field}}}
-
-    page_size = int(getattr(req, "composite_page_size", 800) or 800)
-    max_pages = int(getattr(req, "composite_max_pages", 200) or 200)
-    max_buckets = int(getattr(req, "composite_max_buckets", 200_000) or 200_000)
-
-    state: Dict[str, Any] = {}
-
-    rows: List[Dict[str, Any]] = []
-
-    current_loc = None
-    prev_year = None
-    prev_rev = None
-
-    for b in _composite_buckets(
-        client,
-        index=index_name,
-        query_filters=filters,
-        sources=sources,
-        sub_aggs=sub_aggs,
-        page_size=page_size,
-        agg_name="loc_year",
-        state=state,
-        max_pages=max_pages,
-        max_buckets=max_buckets,
-    ):
-        key = b.get("key") or {}
-        loc = key.get("loc")
-        year_ms = key.get("year")
-
-        dt = _ms_to_dt(year_ms)
-        if not dt or loc is None:
-            continue
-
-        year = dt.year
-        rev = float(((b.get("revenue") or {}).get("value")) or 0.0)
-
-        if loc != current_loc:
-            current_loc = loc
-            prev_year = year
-            prev_rev = rev
-            continue
-
-        if prev_year is not None and prev_rev is not None:
-            delta = rev - prev_rev
-            pct = (delta * 100.0 / prev_rev) if prev_rev > 0 else None
-            rows.append(
-                {
-                    "location_id": loc,
-                    "year": year,
-                    "revenue": rev,
-                    "prev_year": prev_year,
-                    "prev_year_revenue": prev_rev,
-                    "yoy_change": delta,
-                    "yoy_change_pct": pct,
-                }
-            )
-
-        prev_year = year
-        prev_rev = rev
-
-    if not rows:
-        insight = "YoY revenue by location could not be computed because ES did not return enough data."
-    else:
-        latest_year = max(r["year"] for r in rows)
-        latest_rows = [r for r in rows if r["year"] == latest_year and r["yoy_change_pct"] is not None]
-        if latest_rows:
-            mean_yoy = sum(r["yoy_change_pct"] for r in latest_rows) / len(latest_rows)
-            insight = (
-                "YoY revenue by location computed from ES. "
-                f"For the most recent year ({latest_year}), average YoY change across locations is ~{mean_yoy:+.1f}%."
-            )
-        else:
-            insight = "YoY revenue by location computed, but no previous-year baseline is available for % change."
-
-    if state.get("truncated"):
-        insight += (
-            f" (NOTE: results were truncated for safety after {state.get('pages', 0)} pages / "
-            f"{state.get('buckets', 0)} buckets.)"
-        )
-
-    return {
-        "insight": to_json_safe(insight),
-        "rows": to_json_safe(rows),
-        "rules_used": business_rules or "",
-        "engine": "es",
-        "meta": {
-            "composite_pages": state.get("pages"),
-            "composite_buckets": state.get("buckets"),
-            "truncated": state.get("truncated"),
-        },
-    }
-
 def _es_dropoff_visits(
     req,
     client,
@@ -779,7 +409,5 @@ def _es_dropoff_visits(
 __all__ = [
     "_es_month_over_month_visits",
     "_es_seasonal_revenue_patterns",
-    "_es_avg_ticket_size",
-    "_es_yoy_revenue_by_location",
     "_es_dropoff_visits",
 ]

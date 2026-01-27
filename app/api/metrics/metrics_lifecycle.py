@@ -3,6 +3,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Iterable
 from abi.runtime import to_json_safe
 from routes.es_test import _extract_properties_from_mapping
+from app.api.metrics.metrics_promos_coupons import _date_filters_or_default
+from app.api.metrics.shared_utilities import (
+    _field_exists,
+    _safe_es_search,
+)
+    
+    
 from app.api.docs_analytics_routes import (
     ES_MAX_CUSTOMERS_DEFAULT,
     _ms_to_dt,
@@ -17,52 +24,18 @@ from app.api.docs_analytics_routes import (
 # ✅ mapping-aware field existence helper (prevents silent 0 results)
 # -------------------------------------------------------------------
 
-def _field_exists(mappings: Dict[str, Any], dotted: str) -> bool:
-    """
-    True only if 'dotted' exists in mappings (supports multi-fields like *.keyword).
-    Expected mappings shape: {"properties": {...}}.
-    """
-    if not dotted:
-        return False
-
-    node: Any = mappings or {}
-    parts = dotted.split(".")
-
-    for part in parts:
-        if not isinstance(node, dict):
-            return False
-
-        props = node.get("properties") or {}
-        if part in props:
-            node = props[part] or {}
-            continue
-
-        fields = node.get("fields") or {}
-        if part in fields:
-            node = fields[part] or {}
-            continue
-
-        return False
-
-    return True
-
 
 # -------------------------------------------------------------------
 # ES-safe helpers
 # -------------------------------------------------------------------
 
-def _safe_es_search(client, *, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
+def _get_customers_index_and_mappings(client, customers_index: str) -> tuple[str, Dict[str, Any]]:
     """
-    Safety defaults to avoid long-running queries.
-    - timeout: ES-side
-    - track_total_hits: off
-    - request_timeout: client-side
+    Load customers mappings (works even if customers_index is an alias).
     """
-    body = dict(body or {})
-    body.setdefault("timeout", "10s")
-    body.setdefault("track_total_hits", False)
-    return client.search(index=index, body=body, request_timeout=20)
-
+    raw = client.indices.get_mapping(index=customers_index)
+    props = _extract_properties_from_mapping(raw, customers_index)
+    return customers_index, {"properties": props}
 
 def _get_req_int(req, name: str, default: int, *, min_v: int, max_v: int) -> int:
     v = getattr(req, name, default)
@@ -115,83 +88,96 @@ def _get_customer_stats_invoices_only(
 # -------------------------------------------------------------------
 # Metrics (NO rollup)
 # -------------------------------------------------------------------
-
 def _es_avg_days_between_visits_active(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
     """
-    Average days between visits for *active* customers (last visit in last 365 days),
-    using invoice-derived per-customer stats.
+    Avg days between visits for active customers (last_visit in last 365d),
+    using customers.visits_interval_avg (already precomputed avg gap in days).
+
+    Filters:
+      - visits_lifetime >= 2
+      - visits_interval_avg > 0
+      - last_visit >= today-365
+      - OPTIONAL (recommended): sales_pickup_lifetime > 0 (paying customers)
     """
-    if not (req.es_index_name or "").strip():
-        return _es_cannot_answer("Missing invoices index (es_index_name).", business_rules)
+    customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
+    if not customers_index:
+        return _es_cannot_answer("Missing customers index (es_customers_index_name).", business_rules)
 
-    invoices_index, invoices_mappings = _get_invoice_index_and_mappings(client, req.es_index_name)
+    customers_index, cust_mappings = _get_customers_index_and_mappings(client, customers_index)
 
-    today = datetime.now(timezone.utc).date()
-    max_rows = _get_req_int(req, "es_max_rows", 2000, min_v=100, max_v=20_000)
-
-    stats = _get_customer_stats_invoices_only(req, client, invoices_index, invoices_mappings)
-    if stats is None:
+    required = ["customer_id", "last_visit", "visits_lifetime", "visits_interval_avg"]
+    missing = [f for f in required if not _field_exists(cust_mappings, f)]
+    if missing:
         return _es_cannot_answer(
-            "Cannot compute 'average days between visits for active customers' because required invoices fields "
-            "(customer_id, dropoff_at) are missing or could not be derived from the invoices mappings.",
+            f"Cannot compute avg days between visits from customers index '{customers_index}' "
+            f"because required fields are missing: {', '.join(missing)}.",
             business_rules,
         )
 
-    total_days_between = 0.0
-    total_intervals = 0
-    active_rows: List[Dict[str, Any]] = []
+    today = datetime.now(timezone.utc).date()
+    cutoff = (today - timedelta(days=365)).isoformat()
 
-    for s in stats:
-        vc = int(s.get("visit_count") or 0)
-        first = s.get("first_visit")
-        last = s.get("last_visit")
-        if vc <= 1 or not first or not last:
-            continue
-        if (today - last.date()).days > 365:
-            continue
+    # Optional paying filter (keeps consistency with most other KPIs)
+    paying_filter = []
+    if _field_exists(cust_mappings, "sales_pickup_lifetime"):
+        paying_filter = [{"range": {"sales_pickup_lifetime": {"gt": 0}}}]
 
-        days_between = (last.date() - first.date()).days
-        intervals = vc - 1
-        if intervals <= 0:
-            continue
+    base_filters: List[Dict[str, Any]] = [
+        {"range": {"last_visit": {"gte": cutoff}}},
+        {"range": {"visits_lifetime": {"gte": 2}}},
+        {"range": {"visits_interval_avg": {"gt": 0}}},
+        *paying_filter,
+    ]
 
-        total_days_between += float(days_between)
-        total_intervals += intervals
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": base_filters}},
+        "aggs": {
+            "avg_gap_days": {"avg": {"field": "visits_interval_avg"}},
+            "customers_counted": {"value_count": {"field": "customer_id"}},
+        },
+    }
 
-        if len(active_rows) < max_rows:
-            active_rows.append(
-                {
-                    "customer_id": s.get("customer_id"),
-                    "visits": vc,
-                    "avg_days_between_visits_customer": days_between / float(intervals),
-                    "first_visit": first.isoformat(),
-                    "last_visit": last.isoformat(),
-                    "intervals": intervals,
-                }
-            )
+    res = _safe_es_search(client, index=customers_index, body=body)
+    aggs = res.get("aggregations") or {}
+    avg_gap = (aggs.get("avg_gap_days") or {}).get("value")
+    count = int((aggs.get("customers_counted") or {}).get("value") or 0)
 
-    if total_intervals == 0:
+    if avg_gap is None or count == 0:
         return {
             "insight": to_json_safe(
-                "Cannot compute average days between visits for active customers because there are no customers "
-                "with at least two visits in the last 365 days."
+                "No active repeat customers matched the filters (last_visit in 365d and visits_lifetime ≥ 2), "
+                "so the average gap could not be computed."
             ),
             "rows": [],
             "rules_used": business_rules or "",
             "engine": "es",
         }
 
-    avg_days = total_days_between / float(total_intervals)
+    rows = [{
+        "metric": "avg_days_between_visits_active",
+        "label": "Avg Days Between Visits (Active, via visits_interval_avg)",
+        "value": float(avg_gap),
+        "customers_counted": count,
+        "active_window_days": 365,
+        "customers_index": customers_index,
+    }]
+
     insight = (
-        f"For active customers (last visit in the last 365 days), the average gap between visits across the "
-        f"whole company is approximately {avg_days:.1f} days. Rows are limited to {max_rows} for safety."
+        f"Avg days between visits for active repeat customers was computed from customers.visits_interval_avg. "
+        f"Filters: last_visit within 365d, visits_lifetime ≥ 2, visits_interval_avg > 0"
+        f"{' and sales_pickup_lifetime > 0' if paying_filter else ''}. "
+        f"Result: ~{float(avg_gap):.1f} days across {count} customers."
     )
+
     return {
         "insight": to_json_safe(insight),
-        "rows": to_json_safe(active_rows),
+        "rows": to_json_safe(rows),
         "rules_used": business_rules or "",
         "engine": "es",
     }
+
+
 def _es_active_customers(
     req,
     client,
@@ -407,100 +393,141 @@ def _es_overdue_customers(req, client, mappings: Dict[str, Any], business_rules:
 
 def _es_visit_frequency_distribution(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
     """
-    Distribution of customers by visit frequency (invoice-derived stats).
+    Distribution of customers by visits_lifetime bucket:
+      1, 2–5, 6–11, 12+
+
+    Uses customers.visits_lifetime (one doc per customer).
     """
-    if not (req.es_index_name or "").strip():
-        return _es_cannot_answer("Missing invoices index (es_index_name).", business_rules)
+    customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
+    if not customers_index:
+        return _es_cannot_answer("Missing customers index (es_customers_index_name).", business_rules)
 
-    invoices_index, invoices_mappings = _get_invoice_index_and_mappings(client, req.es_index_name)
+    customers_index, cust_mappings = _get_customers_index_and_mappings(client, customers_index)
 
-    stats = _get_customer_stats_invoices_only(req, client, invoices_index, invoices_mappings)
-    if stats is None:
+    if not _field_exists(cust_mappings, "customer_id") or not _field_exists(cust_mappings, "visits_lifetime"):
         return _es_cannot_answer(
-            "Cannot compute 'distribution of customers by visit frequency' because required invoices fields "
-            "(customer_id, dropoff_at) are missing or could not be derived from the invoices mappings.",
+            f"Cannot compute visit frequency distribution because customers index '{customers_index}' "
+            "is missing customer_id and/or visits_lifetime.",
             business_rules,
         )
 
-    buckets = {"1 visit": 0, "2–5 visits": 0, "6–11 visits": 0, "12+ visits": 0}
-    for s in stats:
-        v = int(s.get("visit_count") or 0)
-        if v <= 0:
-            continue
-        if v == 1:
-            buckets["1 visit"] += 1
-        elif 2 <= v <= 5:
-            buckets["2–5 visits"] += 1
-        elif 6 <= v <= 11:
-            buckets["6–11 visits"] += 1
-        else:
-            buckets["12+ visits"] += 1
+    # Optional paying filter (comment out if you want *all* customers regardless of spend)
+    base_filters: List[Dict[str, Any]] = [
+        {"range": {"visits_lifetime": {"gt": 0}}},
+    ]
+    if _field_exists(cust_mappings, "sales_pickup_lifetime"):
+        base_filters.append({"range": {"sales_pickup_lifetime": {"gt": 0}}})
 
-    total = sum(buckets.values())
-    rows = []
-    for label in ["1 visit", "2–5 visits", "6–11 visits", "12+ visits"]:
-        count = buckets[label]
-        pct = (count * 100.0 / total) if total else 0.0
-        rows.append({"frequency_bucket": label, "customer_count": count, "percentage_of_customers": pct})
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": base_filters}},
+        "aggs": {
+            "total": {"value_count": {"field": "customer_id"}},
+            "buckets": {
+                "filters": {
+                    "filters": {
+                        "1_visit": {"term": {"visits_lifetime": 1}},
+                        "2_5": {"range": {"visits_lifetime": {"gte": 2, "lte": 5}}},
+                        "6_11": {"range": {"visits_lifetime": {"gte": 6, "lte": 11}}},
+                        "12_plus": {"range": {"visits_lifetime": {"gte": 12}}},
+                    }
+                }
+            },
+        },
+    }
+
+    res = _safe_es_search(client, index=customers_index, body=body)
+    aggs = res.get("aggregations") or {}
+    total = int((aggs.get("total") or {}).get("value") or 0)
+    b = (aggs.get("buckets") or {}).get("buckets") or {}
+
+    def _row(key: str, label: str) -> Dict[str, Any]:
+        c = int((b.get(key) or {}).get("doc_count") or 0)
+        pct = (100.0 * c / total) if total else 0.0
+        return {"frequency_bucket": label, "customer_count": c, "percentage_of_customers": pct}
+
+    rows = [
+        _row("1_visit", "1 visit"),
+        _row("2_5", "2–5 visits"),
+        _row("6_11", "6–11 visits"),
+        _row("12_plus", "12+ visits"),
+    ]
+
+    insight = (
+        "Visit frequency distribution computed from customers.visits_lifetime"
+        f"{' (paying customers only)' if any('sales_pickup_lifetime' in f.get('range', {}) for f in base_filters) else ''}."
+    )
 
     return {
-        "insight": to_json_safe("Distribution of customers by visit frequency computed from invoice-derived stats."),
+        "insight": to_json_safe(insight),
         "rows": to_json_safe(rows),
         "rules_used": business_rules or "",
         "engine": "es",
     }
 
 
+
 def _es_customers_nth_visit(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
     """
-    Lifetime counts of customers who have reached >=2/3/4/5 visits (invoice-derived stats).
+    Lifetime counts of customers who have reached >=2/3/4/5 visits,
+    using customers.visits_lifetime.
     """
-    if not (req.es_index_name or "").strip():
-        return _es_cannot_answer("Missing invoices index (es_index_name).", business_rules)
+    customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
+    if not customers_index:
+        return _es_cannot_answer("Missing customers index (es_customers_index_name).", business_rules)
 
-    invoices_index, invoices_mappings = _get_invoice_index_and_mappings(client, req.es_index_name)
+    customers_index, cust_mappings = _get_customers_index_and_mappings(client, customers_index)
 
-    stats = _get_customer_stats_invoices_only(req, client, invoices_index, invoices_mappings)
-    if stats is None:
+    required = ["customer_id", "visits_lifetime"]
+    missing = [f for f in required if not _field_exists(cust_mappings, f)]
+    if missing:
         return _es_cannot_answer(
-            "Cannot compute 'Customers Achieving Nth Visit' because required invoices fields "
-            "(customer_id, dropoff_at) are missing or could not be derived from the invoices mappings.",
+            f"Cannot compute Customers Achieving Nth Visit because customers index '{customers_index}' "
+            f"is missing: {', '.join(missing)}.",
             business_rules,
         )
 
-    total_customers = 0
-    c2 = c3 = c4 = c5 = 0
+    base_filters: List[Dict[str, Any]] = [
+        {"range": {"visits_lifetime": {"gt": 0}}},
+    ]
+    if _field_exists(cust_mappings, "sales_pickup_lifetime"):
+        base_filters.append({"range": {"sales_pickup_lifetime": {"gt": 0}}})
 
-    for s in stats:
-        vc = int(s.get("visit_count") or 0)
-        if vc <= 0:
-            continue
-        total_customers += 1
-        if vc >= 2:
-            c2 += 1
-        if vc >= 3:
-            c3 += 1
-        if vc >= 4:
-            c4 += 1
-        if vc >= 5:
-            c5 += 1
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": base_filters}},
+        "aggs": {
+            "total": {"value_count": {"field": "customer_id"}},
+            "ge2": {"filter": {"range": {"visits_lifetime": {"gte": 2}}}},
+            "ge3": {"filter": {"range": {"visits_lifetime": {"gte": 3}}}},
+            "ge4": {"filter": {"range": {"visits_lifetime": {"gte": 4}}}},
+            "ge5": {"filter": {"range": {"visits_lifetime": {"gte": 5}}}},
+        },
+    }
+
+    res = _safe_es_search(client, index=customers_index, body=body)
+    aggs = res.get("aggregations") or {}
+
+    total = int((aggs.get("total") or {}).get("value") or 0)
+    c2 = int((aggs.get("ge2") or {}).get("doc_count") or 0)
+    c3 = int((aggs.get("ge3") or {}).get("doc_count") or 0)
+    c4 = int((aggs.get("ge4") or {}).get("doc_count") or 0)
+    c5 = int((aggs.get("ge5") or {}).get("doc_count") or 0)
 
     rows = [
         {"metric": "customers_2plus_visits", "label": "Customers Achieving 2nd Visit (≥2 visits)", "value": c2},
         {"metric": "customers_3plus_visits", "label": "Customers Achieving 3rd Visit (≥3 visits)", "value": c3},
         {"metric": "customers_4plus_visits", "label": "Customers Achieving 4th Visit (≥4 visits)", "value": c4},
         {"metric": "customers_5plus_visits", "label": "Customers Achieving 5th Visit (≥5 visits)", "value": c5},
-        {"metric": "total_customers_lifetime", "label": "Total Customers (lifetime)", "value": total_customers},
+        {"metric": "total_customers_lifetime", "label": "Total Customers (visits_lifetime > 0)", "value": total},
     ]
 
     return {
-        "insight": to_json_safe("Customers achieving Nth visit computed from invoice-derived stats."),
+        "insight": to_json_safe("Customers achieving Nth visit computed from customers.visits_lifetime."),
         "rows": to_json_safe(rows),
         "rules_used": business_rules or "",
         "engine": "es",
     }
-
-
 def _es_top_customers_by_revenue(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
     """
     Top 5% / Top 20% customers by revenue (invoice-derived stats).
@@ -574,96 +601,80 @@ def _es_top_customers_by_revenue(req, client, mappings: Dict[str, Any], business
         "engine": "es",
     }
 
-
-def _es_new_customer_acquisition(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
+def _es_new_customer_acquisition_from_customers(
+    req,
+    client,
+    cust_mappings: Dict[str, Any],
+    business_rules: Optional[str],
+):
     """
-    New customers over time.
-    Definition:
-      - Customer's first_visit date is within [start_date, end_date] if provided
-      - Optional join with customers_index (original_signup) to require diff <= 30 days
-
-    NO rollup: uses invoice-derived stats.
+    New Customer Acquisition (cheap)
+    Definition: count customers by original_signup (or created_at fallback), grouped by month or quarter.
     """
-    invoices_index_in = (req.es_index_name or "").strip()
     customers_index = (req.es_customers_index_name or "").strip()
+    if not customers_index:
+        return _es_cannot_answer("New Customer Acquisition requires customers index (es_customers_index_name).", business_rules)
 
-    if not invoices_index_in or not customers_index:
+    # pick the best date field available
+    date_field = "original_signup" if _field_exists(cust_mappings, "original_signup") else None
+    if not date_field and _field_exists(cust_mappings, "created_at"):
+        date_field = "created_at"
+
+    if not date_field:
         return _es_cannot_answer(
-            "New Customer Acquisition requires both an invoices index (es_index_name) and a customers index (es_customers_index_name).",
+            "Cannot compute New Customer Acquisition because neither customers.original_signup nor customers.created_at exists.",
             business_rules,
         )
 
-    invoices_index, invoices_mappings = _get_invoice_index_and_mappings(client, invoices_index_in)
-
-    # customers mapping (read-only OK)
-    cust_mapping_raw = client.indices.get_mapping(index=customers_index)
-    cust_props = _extract_properties_from_mapping(cust_mapping_raw, customers_index)
-    cust_mappings = {"properties": cust_props}
-    signup_by_customer = _es_get_customer_signups(client, customers_index, cust_mappings)
-
-    start_d = _parse_date_str(getattr(req, "start_date", None))
-    end_d = _parse_date_str(getattr(req, "end_date", None))
-    max_diff_days = 30
+    filters, window_label = _date_filters_or_default(req, date_field)
+    filters.append({"exists": {"field": date_field}})
 
     ql = (getattr(req, "question", "") or "").lower()
     use_quarter = any(p in ql for p in ["quarter", "q1", "q2", "q3", "q4"])
 
-    counts: Dict[str, int] = {}
+    # month is standard; quarter you can either:
+    # - still use month and convert in python, OR
+    # - use a runtime field (not cheap), so do python conversion.
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "by_month": {
+                "date_histogram": {
+                    "field": date_field,
+                    "calendar_interval": "month",
+                    "min_doc_count": 0,
+                }
+            }
+        },
+    }
 
-    stats = _get_customer_stats_invoices_only(req, client, invoices_index, invoices_mappings)
-    if stats is None:
-        return _es_cannot_answer(
-            "Cannot compute 'New Customer Acquisition' because required invoices fields "
-            "(customer_id, dropoff_at) are missing or could not be derived from the invoices mappings.",
-            business_rules,
-        )
+    res = _safe_es_search(client, index=customers_index, body=body)
+    buckets = (((res.get("aggregations") or {}).get("by_month") or {}).get("buckets") or [])
 
-    for s in stats:
-        cid = s.get("customer_id")
-        first = s.get("first_visit")
-        if not cid or not first:
+    # build rows
+    counts = {}
+    for b in buckets:
+        key_as_string = b.get("key_as_string")  # ISO datetime
+        doc_count = int(b.get("doc_count") or 0)
+        if not key_as_string:
             continue
-
-        fd = first.date()
-        if start_d and fd < start_d:
-            continue
-        if end_d and fd > end_d:
-            continue
-
-        signup_date = signup_by_customer.get(cid)
-        if signup_date is not None:
-            diff_days = (fd - signup_date).days
-            if diff_days < 0 or diff_days > max_diff_days:
-                continue
-
+        # key_as_string like "2026-01-01T00:00:00.000Z" -> take YYYY-MM
+        ym = key_as_string[:7]
         if use_quarter:
-            q = (fd.month - 1) // 3 + 1
-            label = f"{fd.year}-Q{q}"
+            y = int(ym[:4]); m = int(ym[5:7])
+            q = (m - 1) // 3 + 1
+            label = f"{y}-Q{q}"
         else:
-            label = f"{fd.year}-{fd.month:02d}"
-
-        counts[label] = counts.get(label, 0) + 1
+            label = ym
+        counts[label] = counts.get(label, 0) + doc_count
 
     rows = [{"period": p, "new_customers": c} for p, c in sorted(counts.items())]
 
-    window_desc = []
-    if getattr(req, "start_date", None):
-        window_desc.append(f"from {req.start_date}")
-    if getattr(req, "end_date", None):
-        window_desc.append(f"to {req.end_date}")
-    window_str = " ".join(window_desc) if window_desc else "for all available history"
-
-    freq_label = "quarter" if use_quarter else "month"
-
-    if not rows:
-        insight = f"New Customer Acquisition by {freq_label} could not be computed {window_str} because no customers met the criteria."
-    else:
-        last = rows[-1]
-        insight = (
-            f"New Customer Acquisition by {freq_label} was computed from invoice-derived first_visit, joined with "
-            f"customers index '{customers_index}' (original_signup). Window: {window_str}. "
-            f"Most recent {freq_label} ({last['period']}) has {last['new_customers']} new customers."
-        )
+    insight = (
+        f"New Customer Acquisition computed from customers.{date_field} ({window_label}), "
+        f"grouped by {'quarter' if use_quarter else 'month'}."
+    )
 
     return {
         "insight": to_json_safe(insight),
@@ -671,7 +682,6 @@ def _es_new_customer_acquisition(req, client, mappings: Dict[str, Any], business
         "rules_used": business_rules or "",
         "engine": "es",
     }
-
 
 def _es_new_customer_30d_return_rate(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
     """
@@ -3066,264 +3076,6 @@ def _es_route_vs_retail_comparison(
         "rules_used": business_rules or "",
         "engine": "es",
     }
-def _es_customer_value_tiers(
-    req,
-    client,
-    mappings: Dict[str, Any],
-    business_rules: Optional[str],
-):
-    """
-    Customer Value Tiers (customers index).
-
-    Tier Definitions (by sales_pickup_lifetime + visits_lifetime):
-      - Tier 1 (Top 5%):     sales_pickup_lifetime >= P95
-      - Tier 2 (Next 15%):   P80 <= sales_pickup_lifetime < P95
-      - Tier 3 (Repeat):     visits_lifetime >= 2 AND sales_pickup_lifetime < P80
-      - Tier 4 (Single):     visits_lifetime == 1
-
-    Also returns revenue share per tier:
-      revenue_share_pct = tier_revenue / total_revenue * 100
-
-    Optional extra metrics per tier (if fields exist):
-      - avg_visit_value = avg(visit_average_sales)
-      - avg_pieces = avg(visit_average_pieces)
-      - visits_per_year = AVG(visits_lifetime / years_since_first_visit) (scripted) if first_visit exists
-    """
-
-    customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
-    if not customers_index:
-        return _es_cannot_answer(
-            "Customer Value Tiers requires a customers index (es_customers_index_name).",
-            business_rules,
-        )
-
-    # ---- Load mapping ----
-    try:
-        cust_mapping_raw = client.indices.get_mapping(index=customers_index)
-    except Exception:
-        cust_mapping_raw = None
-
-    if cust_mapping_raw is None:
-        return _es_cannot_answer(
-            f"Could not load mappings for customers index '{customers_index}' when computing Customer Value Tiers.",
-            business_rules,
-        )
-
-    cust_props = _extract_properties_from_mapping(cust_mapping_raw, customers_index)
-    cust_mappings = {"properties": cust_props}
-
-    # Required for tiers
-    required_fields = ["customer_id", "sales_pickup_lifetime", "visits_lifetime"]
-    missing = [f for f in required_fields if not _field_exists(cust_mappings, f)]
-    if missing:
-        return _es_cannot_answer(
-            "Cannot compute 'Customer Value Tiers' because required fields are missing from customers index "
-            f"'{customers_index}': {', '.join(missing)}.",
-            business_rules,
-        )
-
-    # Optional fields for “details” per tier
-    visit_avg_field = "visit_average_sales" if _field_exists(cust_mappings, "visit_average_sales") else None
-    pieces_field = "visit_average_pieces" if _field_exists(cust_mappings, "visit_average_pieces") else None
-    has_first_visit = _field_exists(cust_mappings, "first_visit")
-
-    # Base population:
-    # We exclude customers with no revenue field, but allow 0 revenue.
-    # You can tighten this to gt:0 if you want tiers only among spenders.
-    base_filters = [
-        {"exists": {"field": "customer_id"}},
-        {"exists": {"field": "visits_lifetime"}},
-        {"range": {"visits_lifetime": {"gte": 1}}},
-        {"exists": {"field": "sales_pickup_lifetime"}},
-        {"range": {"sales_pickup_lifetime": {"gte": 0}}},
-    ]
-
-    # ---- Step 1: compute P80 and P95 among the base population ----
-    # Note: percentile agg is approximate; good enough for tiering at scale.
-    pct_body = {
-        "size": 0,
-        "query": {"bool": {"filter": base_filters}},
-        "aggs": {
-            "rev_percentiles": {
-                "percentiles": {
-                    "field": "sales_pickup_lifetime",
-                    "percents": [80, 95],
-                    # optional tuning:
-                    # "hdr": {"number_of_significant_value_digits": 3}
-                }
-            },
-            "total_revenue": {"sum": {"field": "sales_pickup_lifetime"}},
-            "total_customers": {"cardinality": {"field": "customer_id"}},
-        },
-    }
-
-    pct_res = _safe_es_search(client, index=customers_index, body=pct_body)
-    pct_aggs = pct_res.get("aggregations") or {}
-    vals = ((pct_aggs.get("rev_percentiles") or {}).get("values")) or {}
-
-    p80 = vals.get("80.0")
-    p95 = vals.get("95.0")
-
-    if p80 is None or p95 is None:
-        return _es_cannot_answer(
-            "Cannot compute 'Customer Value Tiers' because revenue percentiles (P80/P95) could not be derived.",
-            business_rules,
-        )
-
-    try:
-        p80 = float(p80)
-        p95 = float(p95)
-    except Exception:
-        return _es_cannot_answer(
-            "Cannot compute 'Customer Value Tiers' because revenue percentiles (P80/P95) were not numeric.",
-            business_rules,
-        )
-
-    total_revenue = float((pct_aggs.get("total_revenue") or {}).get("value") or 0.0)
-    total_customers = int((pct_aggs.get("total_customers") or {}).get("value") or 0)
-
-    if total_customers <= 0:
-        return {
-            "insight": to_json_safe(
-                "Customer Value Tiers could not be computed because no customers matched the base population."
-            ),
-            "rows": [],
-            "rules_used": business_rules or "",
-            "engine": "es",
-        }
-
-    # ---- Step 2: tier buckets via filters aggregation ----
-    # Tier 4 is strictly visits == 1 (even if high revenue, per your definition).
-    # Tier 3 is repeat (>=2) AND revenue < P80.
-    # Tier 1 and Tier 2 based on revenue thresholds (regardless of visits count, except Tier4 excluded).
-    tier_filters = {
-        "tier_1": {
-            "bool": {
-                "filter": [
-                    {"range": {"sales_pickup_lifetime": {"gte": p95}}},
-                    {"range": {"visits_lifetime": {"gte": 1}}},
-                    {"bool": {"must_not": [{"term": {"visits_lifetime": 1}}]}},  # exclude Tier 4
-                ]
-            }
-        },
-        "tier_2": {
-            "bool": {
-                "filter": [
-                    {"range": {"sales_pickup_lifetime": {"gte": p80, "lt": p95}}},
-                    {"range": {"visits_lifetime": {"gte": 1}}},
-                    {"bool": {"must_not": [{"term": {"visits_lifetime": 1}}]}},  # exclude Tier 4
-                ]
-            }
-        },
-        "tier_3": {
-            "bool": {
-                "filter": [
-                    {"range": {"visits_lifetime": {"gte": 2}}},
-                    {"range": {"sales_pickup_lifetime": {"lt": p80}}},
-                ]
-            }
-        },
-        "tier_4": {
-            "term": {"visits_lifetime": 1}
-        },
-    }
-
-    # per-tier aggregations
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    tier_aggs: Dict[str, Any] = {
-        "customer_count": {"cardinality": {"field": "customer_id"}},
-        "tier_revenue": {"sum": {"field": "sales_pickup_lifetime"}},
-    }
-
-    if visit_avg_field:
-        tier_aggs["avg_transaction_value"] = {"avg": {"field": visit_avg_field}}
-
-    if pieces_field:
-        tier_aggs["avg_pieces_per_visit"] = {"avg": {"field": pieces_field}}
-
-    if has_first_visit:
-        tier_aggs["avg_visits_per_year"] = {
-            "avg": {
-                "script": {
-                    "params": {"now": now_ms},
-                    "source": """
-                        if (doc['visits_lifetime'].size()==0 || doc['first_visit'].size()==0) return 0;
-                        double v = doc['visits_lifetime'].value;
-                        long first = doc['first_visit'].value.toInstant().toEpochMilli();
-                        double years = (params.now - first) / 31557600000.0; // 365.25 days
-                        if (years < 0.01) years = 0.01;
-                        return v / years;
-                    """,
-                }
-            }
-        }
-
-    tiers_body = {
-        "size": 0,
-        "query": {"bool": {"filter": base_filters}},
-        "aggs": {
-            "tiers": {
-                "filters": {"filters": tier_filters},
-                "aggs": tier_aggs,
-            }
-        },
-    }
-
-    tiers_res = _safe_es_search(client, index=customers_index, body=tiers_body)
-    tiers_aggs = tiers_res.get("aggregations") or {}
-    buckets = ((tiers_aggs.get("tiers") or {}).get("buckets")) or {}
-
-    tier_meta = [
-        ("tier_1", "Tier 1 (Top 5%)"),
-        ("tier_2", "Tier 2 (Next 15%)"),
-        ("tier_3", "Tier 3 (Repeat, Non-Top 20%)"),
-        ("tier_4", "Tier 4 (Single Visit)"),
-    ]
-
-    rows: List[Dict[str, Any]] = []
-    for key, label in tier_meta:
-        b = buckets.get(key) or {}
-        count = int((b.get("customer_count") or {}).get("value") or 0)
-        rev = float((b.get("tier_revenue") or {}).get("value") or 0.0)
-
-        cust_pct = (count * 100.0 / float(total_customers)) if total_customers > 0 else 0.0
-        rev_share = (rev * 100.0 / float(total_revenue)) if total_revenue > 0 else 0.0
-
-        row: Dict[str, Any] = {
-            "tier_id": key,
-            "tier_label": label,
-            "customer_count": count,
-            "customer_pct": cust_pct,
-            "tier_revenue": rev,
-            "revenue_share_pct": rev_share,
-            "thresholds": {
-                "p80_revenue": p80,
-                "p95_revenue": p95,
-            },
-        }
-
-        if visit_avg_field:
-            row["avg_transaction_value"] = float((b.get("avg_transaction_value") or {}).get("value") or 0.0)
-        if pieces_field:
-            row["avg_pieces_per_visit"] = (b.get("avg_pieces_per_visit") or {}).get("value")
-        if has_first_visit:
-            row["avg_visits_per_year"] = float((b.get("avg_visits_per_year") or {}).get("value") or 0.0)
-
-        rows.append(row)
-
-    insight = (
-        "Customer Value Tiers ranks customers by lifetime revenue (sales_pickup_lifetime) and splits them into tiers "
-        "using the 80th and 95th percentiles: Tier 1 (>=P95), Tier 2 (P80–P95), Tier 3 (repeat >=2 visits and <P80), "
-        "and Tier 4 (single visit). It also reports customer share and revenue share per tier."
-    )
-
-    return {
-        "insight": to_json_safe(insight),
-        "rows": to_json_safe(rows),
-        "rules_used": business_rules or "",
-        "engine": "es",
-    }
 def _es_churn_rate(
     req,
     client,
@@ -3656,201 +3408,6 @@ def _es_days_since_last_visit_distribution(
         "rules_used": business_rules or "",
         "engine": "es",
     }
-def _es_price_segments_by_avg_visit_value(
-    req,
-    client,
-    mappings: Dict[str, Any],
-    business_rules: Optional[str],
-):
-    """
-    Price Segments by Average Visit Value (customers index).
-
-    Segments by visit_average_sales:
-      - Under $25:  < 25
-      - $25–$50:    25 <= x < 50
-      - $50–$75:    50 <= x < 75
-      - Over $75:   >= 75
-
-    For each segment:
-      - Customer % = segment_count / total_with_visit_value × 100
-      - Revenue Share = segment_lifetime_revenue / total_revenue × 100
-      - Visits/Year = AVG( visits_lifetime / years_since_first_visit )
-        where years_since_first_visit = (now - first_visit) / 365.25 days
-      - Pieces = AVG(visit_average_pieces) if available
-
-    IMPORTANT OPTIMIZATION:
-      - Uses value_count(customer_id) instead of cardinality(customer_id).
-      - This assumes 1 doc per customer in customers index (_id = customer_id).
-    """
-
-    customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
-    if not customers_index:
-        return _es_cannot_answer(
-            "Price Segments by Average Visit Value requires a customers index (es_customers_index_name).",
-            business_rules,
-        )
-
-    # Load customers mappings (router 'mappings' may not be customers mappings)
-    try:
-        cust_mapping_raw = client.indices.get_mapping(index=customers_index)
-    except Exception:
-        cust_mapping_raw = None
-
-    if cust_mapping_raw is None:
-        return _es_cannot_answer(
-            f"Could not load mappings for customers index '{customers_index}' "
-            "when computing Price Segments by Average Visit Value.",
-            business_rules,
-        )
-
-    cust_props = _extract_properties_from_mapping(cust_mapping_raw, customers_index)
-    cust_mappings = {"properties": cust_props}
-
-    visit_avg_field = "visit_average_sales"
-
-    # Required fields
-    required_fields = ["customer_id", visit_avg_field, "sales_pickup_lifetime", "visits_lifetime", "first_visit"]
-    missing = [f for f in required_fields if not _field_exists(cust_mappings, f)]
-    if missing:
-        return _es_cannot_answer(
-            "Cannot compute 'Price Segments by Average Visit Value' because required fields are missing "
-            f"from customers index '{customers_index}': {', '.join(missing)}.",
-            business_rules,
-        )
-
-    # Optional pieces metric
-    pieces_field: Optional[str] = (
-        "visit_average_pieces" if _field_exists(cust_mappings, "visit_average_pieces") else None
-    )
-
-    # Base filters (population)
-    base_filters = [
-        {"exists": {"field": visit_avg_field}},
-        {"exists": {"field": "sales_pickup_lifetime"}},
-        {"range": {"sales_pickup_lifetime": {"gt": 0}}},
-        {"exists": {"field": "visits_lifetime"}},
-        {"range": {"visits_lifetime": {"gt": 0}}},
-        {"exists": {"field": "first_visit"}},
-        {"exists": {"field": "customer_id"}},
-    ]
-
-    # Segment ranges
-    segments_filters = {
-        "under_25": {"range": {visit_avg_field: {"lt": 25}}},
-        "25_50": {"range": {visit_avg_field: {"gte": 25, "lt": 50}}},
-        "50_75": {"range": {visit_avg_field: {"gte": 50, "lt": 75}}},
-        "75_plus": {"range": {visit_avg_field: {"gte": 75}}},
-    }
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    seg_aggs: Dict[str, Any] = {
-        # ✅ Faster + exact if 1-doc-per-customer
-        "customer_count": {"value_count": {"field": "customer_id"}},
-        "segment_revenue": {"sum": {"field": "sales_pickup_lifetime"}},
-        "avg_visit_value": {"avg": {"field": visit_avg_field}},
-        # Visits/Year per definition: AVG(visits_lifetime / years_since_first_visit)
-        "visits_per_year": {
-            "avg": {
-                "script": {
-                    "params": {"now": now_ms},
-                    "source": """
-                        if (doc['visits_lifetime'].size()==0 || doc['first_visit'].size()==0) return 0;
-                        double v = doc['visits_lifetime'].value;
-                        long first = doc['first_visit'].value.toInstant().toEpochMilli();
-                        double years = (params.now - first) / 31557600000.0; // 365.25 days
-                        if (years < 0.01) years = 0.01; // prevent divide-by-zero for very new customers
-                        return v / years;
-                    """,
-                }
-            }
-        },
-    }
-
-    if pieces_field:
-        seg_aggs["avg_pieces"] = {"avg": {"field": pieces_field}}
-
-    body = {
-        "size": 0,
-        "query": {"bool": {"filter": base_filters}},
-        "aggs": {
-            "segments": {
-                "filters": {"filters": segments_filters},
-                "aggs": seg_aggs,
-            },
-            "total_revenue": {"sum": {"field": "sales_pickup_lifetime"}},
-            # ✅ Faster + exact if 1-doc-per-customer
-            "total_customers_with_visit_value": {"value_count": {"field": "customer_id"}},
-        },
-    }
-
-    res = _safe_es_search(client, index=customers_index, body=body)
-    aggs = res.get("aggregations") or {}
-
-    seg_buckets = (aggs.get("segments") or {}).get("buckets") or {}
-    total_revenue = float((aggs.get("total_revenue") or {}).get("value") or 0.0)
-    total_customers = float((aggs.get("total_customers_with_visit_value") or {}).get("value") or 0.0)
-
-    if total_customers <= 0 or total_revenue <= 0:
-        return {
-            "insight": to_json_safe(
-                "Price Segments by Average Visit Value could not be computed because no customers with "
-                "positive sales_pickup_lifetime and visit_average_sales were found."
-            ),
-            "rows": [],
-            "rules_used": business_rules or "",
-            "engine": "es",
-        }
-
-    def summarize(seg_key: str, label: str) -> Dict[str, Any]:
-        b = seg_buckets.get(seg_key) or {}
-        cust_count = float((b.get("customer_count") or {}).get("value") or 0.0)
-        seg_revenue = float((b.get("segment_revenue") or {}).get("value") or 0.0)
-        avg_visit_value = float((b.get("avg_visit_value") or {}).get("value") or 0.0)
-        visits_per_year = float((b.get("visits_per_year") or {}).get("value") or 0.0)
-
-        avg_pieces = None
-        if pieces_field:
-            avg_pieces = (b.get("avg_pieces") or {}).get("value")
-
-        customer_pct = (cust_count * 100.0 / total_customers) if total_customers > 0 else 0.0
-        revenue_share_pct = (seg_revenue * 100.0 / total_revenue) if total_revenue > 0 else 0.0
-
-        return {
-            "segment_id": seg_key,
-            "segment_label": label,
-            "customer_count": int(cust_count),
-            "customer_pct": customer_pct,
-            "segment_revenue": seg_revenue,
-            "revenue_share_pct": revenue_share_pct,
-            "visits_per_year": visits_per_year,
-            "avg_visit_value": avg_visit_value,
-            "avg_pieces": avg_pieces,
-        }
-
-    rows: List[Dict[str, Any]] = [
-        summarize("under_25", "Under $25"),
-        summarize("25_50", "$25–$50"),
-        summarize("50_75", "$50–$75"),
-        summarize("75_plus", "Over $75"),
-    ]
-
-    insight = (
-        "Price Segments by Average Visit Value uses visit_average_sales on the customers index "
-        f"'{customers_index}' to group customers into Under $25, $25–$50, $50–$75 and Over $75 segments. "
-        "For each segment, it reports share of customers, share of lifetime revenue, visits per year "
-        "(computed per-customer from first_visit), and average per-visit spend (and pieces, if available). "
-        "Counts use value_count(customer_id) assuming 1 document per customer."
-    )
-
-    return {
-        "insight": to_json_safe(insight),
-        "rows": to_json_safe(rows),
-        "rules_used": business_rules or "",
-        "engine": "es",
-    }
-
-
 def _es_daily_acquisition_rate_by_period_customers(
     req,
     client,
@@ -4359,15 +3916,20 @@ def _es_repeat_customers_365(
     business_rules: Optional[str],
 ):
     """
-    Repeat Customers (365 Days)
+    Repeat Customers (365 Days) — customers index
 
     Definition:
       - Base population: customers with visits_365 > 0
-      - Exclusion (same as your other 365 metrics):
+      - Optional exclusion (same as other 365 metrics):
           exclude customers where original_signup is within last N days (default 180)
           AND visits_365 = 1
       - Repeat customers: visits_365 >= 2
       - Repeat Rate = repeat / base * 100
+
+    OPTIMIZATION:
+      - Uses value_count(customer_id) instead of cardinality(customer_id)
+      - Assumes 1 doc per customer in customers index (_id == customer_id)
+        If that assumption might be false, switch back to cardinality.
     """
 
     customers_index = (getattr(req, "es_customers_index_name", "") or "").strip()
@@ -4418,12 +3980,14 @@ def _es_repeat_customers_365(
     cutoff_signup = today - timedelta(days=int(min_signup_age_days))
     cutoff_signup_str = cutoff_signup.isoformat()
 
+    # Base population: customers with visits_365 > 0
     base_filters: List[Dict[str, Any]] = [
         {"exists": {"field": "customer_id"}},
         {"exists": {"field": "visits_365"}},
         {"range": {"visits_365": {"gt": 0}}},
     ]
 
+    # Exclude very new one-visit customers (optional, if original_signup exists)
     must_not: List[Dict[str, Any]] = []
     if has_signup:
         must_not.append(
@@ -4441,10 +4005,15 @@ def _es_repeat_customers_365(
         "size": 0,
         "query": {"bool": {"filter": base_filters, "must_not": must_not}},
         "aggs": {
-            "base_customers": {"cardinality": {"field": "customer_id"}},
+            # ✅ CHANGED: exact + cheaper if 1 doc per customer
+            "base_customers": {"value_count": {"field": "customer_id"}},
+
             "repeat_customers": {
                 "filter": {"range": {"visits_365": {"gte": 2}}},
-                "aggs": {"customers": {"cardinality": {"field": "customer_id"}}},
+                "aggs": {
+                    # ✅ CHANGED: exact + cheaper if 1 doc per customer
+                    "customers": {"value_count": {"field": "customer_id"}}
+                },
             },
         },
     }
@@ -4487,6 +4056,15 @@ def _es_repeat_customers_365(
         {"metric": "repeat_customers_365", "label": "Repeat Customers (365d)", "value": repeat_n},
         {"metric": "base_customers_365", "label": "Customers with visits_365 > 0 (filtered base)", "value": base_n},
         {"metric": "repeat_customers_365_pct", "label": "Repeat Customers 365 (%)", "value": repeat_pct},
+        {
+            "metric": "repeat_customers_365_params",
+            "label": "Params",
+            "value": {
+                "min_signup_age_days_for_repeat_365": int(min_signup_age_days),
+                "applied_new_single_visit_exclusion": bool(has_signup),
+                "customers_index": customers_index,
+            },
+        },
     ]
 
     return {
@@ -4495,6 +4073,7 @@ def _es_repeat_customers_365(
         "rules_used": business_rules or "",
         "engine": "es",
     }
+
 def _es_high_value_retail_targets(
     req,
     client,
@@ -4666,7 +4245,7 @@ __all__ = [
     "_es_overdue_customers",
     "_es_visit_frequency_distribution",
     "_es_customers_nth_visit",
-    "_es_new_customer_acquisition",
+    "_es_new_customer_acquisition_from_customers",
     "_es_new_customer_30d_return_rate",
     "_es_top_customers_by_revenue",
     "_es_active_customers",
@@ -4683,10 +4262,8 @@ __all__ = [
     "_es_visit_frequency_365",
     "_es_visit_frequency_730",
     "_es_route_vs_retail_comparison",
-    "_es_customer_value_tiers",
     "_es_churn_rate",
     "_es_days_since_last_visit_distribution",
-    "_es_price_segments_by_avg_visit_value",
     "_es_daily_acquisition_rate_by_period_customers",
     "_es_yoy_new_customers_customers_index",
     "_es_return_rate_by_cohort_year_customers",

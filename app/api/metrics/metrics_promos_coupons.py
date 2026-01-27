@@ -7,34 +7,30 @@ from abi.runtime import to_json_safe
 from routes.es_test import _extract_properties_from_mapping
 from app.api.docs_analytics_routes import (
     resolve_es_field,
-    _ms_to_dt,
     _es_cannot_answer,
     _build_date_range_filter,
+)
+from app.api.metrics.shared_utilities import (
+    _field_exists,
+    _safe_es_search,
 )
 
 # -------------------------------------------------------------------
 # Safety limits (server-friendly defaults)
 # -------------------------------------------------------------------
 
-DEFAULT_WINDOW_DAYS = 365          # if user does not pass start/end
-MAX_SCAN_HITS = 50_000             # max docs scanned via search_after
-MAX_SCAN_PAGES = 200               # max pages via search_after
-MAX_COMPOSITE_PAGES = 500          # max composite pages
-MAX_TOP20_CUSTOMERS = 50_000       # cap customers scanned for "Top 20%" tag
-MAX_ROWS_RETURNED = 10_000         # cap returned rows
-TERMS_CHUNK_SIZE = 1000            # safer than 2000 in many clusters
+DEFAULT_WINDOW_DAYS = 365
+MAX_SCAN_HITS = 50_000
+MAX_SCAN_PAGES = 200
+MAX_COMPOSITE_PAGES = 500
+MAX_TOP20_CUSTOMERS = 50_000
+MAX_ROWS_RETURNED = 10_000
+TERMS_CHUNK_SIZE = 1000
 
 
 # -------------------------------------------------------------------
 # Small ES-safe helpers (performance + robustness)
 # -------------------------------------------------------------------
-
-def _safe_es_search(client, *, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    body = dict(body or {})
-    body.setdefault("timeout", "10s")
-    body.setdefault("track_total_hits", False)
-    return client.search(index=index, body=body, request_timeout=20)
-
 
 def _chunks(lst: List[Any], n: int) -> Iterable[List[Any]]:
     for i in range(0, len(lst), n):
@@ -81,17 +77,27 @@ def _scan_all_hits(
     page_size: int = 2000,
     max_hits: int = MAX_SCAN_HITS,
     max_pages: int = MAX_SCAN_PAGES,
+    sort: Optional[List[Dict[str, Any]]] = None,
 ) -> Iterable[Dict[str, Any]]:
     """
     Scan hits using search_after (no scroll) with hard caps.
+
+    ✅ IMPORTANT:
+    - DO NOT sort by '_id' (ES blocks fielddata on _id by default).
+    - Provide a deterministic sort on a real field when possible (recommended).
+    - If sort is not provided, uses '_doc' as a best-effort fallback.
+      (For large scans, prefer passing a stable business key like customer_id.)
     """
-    body: Dict[str, Any] = {
+    effective_sort = sort if sort else [{"_doc": "asc"}]
+
+    base_body: Dict[str, Any] = {
         "size": page_size,
         "query": query or {"match_all": {}},
-        "sort": [{"_id": "asc"}],
+        "sort": effective_sort,
+        "track_total_hits": False,
     }
     if source_fields is not None:
-        body["_source"] = source_fields
+        base_body["_source"] = source_fields
 
     search_after = None
     emitted = 0
@@ -101,6 +107,7 @@ def _scan_all_hits(
         if pages >= max_pages or emitted >= max_hits:
             break
 
+        body = dict(base_body)
         if search_after is not None:
             body["search_after"] = search_after
 
@@ -177,37 +184,6 @@ def _composite_by_customer(
 # -------------------------------------------------------------------
 # ✅ mapping-aware field existence + safe field resolver
 # -------------------------------------------------------------------
-
-def _field_exists(mappings: Dict[str, Any], dotted: str) -> bool:
-    """
-    True only if 'dotted' exists in mappings (supports multi-fields like *.keyword).
-    Prevents silent 0-results when querying non-existing fields.
-    """
-    if not dotted:
-        return False
-
-    node: Any = mappings or {}
-    parts = dotted.split(".")
-
-    for part in parts:
-        if not isinstance(node, dict):
-            return False
-
-        props = node.get("properties") or {}
-        if part in props:
-            node = props[part] or {}
-            continue
-
-        fields = node.get("fields") or {}
-        if part in fields:
-            node = fields[part] or {}
-            continue
-
-        return False
-
-    return True
-
-
 def _resolve_existing_field(
     mappings: Dict[str, Any],
     *,
@@ -308,36 +284,52 @@ def _es_invoices_with_redo_items(
     Invoices with Redo Items
     ✅ Always returns a metric row (value can be 0)
 
-    ✅ MODIFIED: use mapping-direct fields that actually exist:
-       - date_field = dropoff_at
-       - invoice_id_field = invoice_id (NOT invoice_id.keyword; invoice_id is integer)
-       - coupon_field = coupon
+    Definition:
+      - Count distinct invoice_id where coupon.keyword is exactly one of: REDO/Redo/redo
+      - Windowed by dropoff_at
     """
     index_name = req.es_index_name.strip()
 
-    # ✅ MODIFIED PART START ---------------------------------------------
+    # --- direct fields from your mapping ---
     date_field = "dropoff_at"
     invoice_id_field = "invoice_id"
-    coupon_field = "coupon"
+    coupon_text_field = "coupon"
+    coupon_kw_field = "coupon.keyword"
 
-    # mappings passed in should be {"properties": ...}
+    # resolve only if the direct field isn't present (keeps it robust)
     if not _field_exists(mappings, date_field):
         date_field = resolve_es_field(mappings, user_term="dropoff_at", alias_family="date") or date_field
-    if not _field_exists(mappings, coupon_field):
-        coupon_field = resolve_es_field(mappings, user_term="coupon") or coupon_field
 
-    if not (_field_exists(mappings, date_field) and _field_exists(mappings, invoice_id_field) and _field_exists(mappings, coupon_field)):
+    if not _field_exists(mappings, coupon_text_field):
+        coupon_text_field = resolve_es_field(mappings, user_term="coupon") or coupon_text_field
+
+    # prefer coupon.keyword; fall back to coupon if keyword doesn't exist
+    if not _field_exists(mappings, coupon_kw_field):
+        # if coupon_text_field is already "coupon.keyword", keep it
+        if coupon_text_field.endswith(".keyword") and _field_exists(mappings, coupon_text_field):
+            coupon_kw_field = coupon_text_field
+        else:
+            coupon_kw_field = ""  # force fallback below
+
+    if not (_field_exists(mappings, date_field) and _field_exists(mappings, invoice_id_field) and _field_exists(mappings, coupon_text_field)):
         return _es_cannot_answer(
             "Cannot compute 'Invoices with Redo Items' because dropoff_at, invoice_id, "
             "or coupon fields are missing from the invoices Elasticsearch mappings.",
             business_rules,
         )
-    # ✅ MODIFIED PART END -----------------------------------------------
 
     filters, window_label = _date_filters_or_default(req, date_field)
 
-    should_clauses = _coupon_should_clauses(mappings, coupon_field, ["redo"])
-    filters.append({"bool": {"should": should_clauses, "minimum_should_match": 1}})
+    # ✅ MODIFIED PART START ------------------------------------------------
+    # Cheapest: exact match on coupon.keyword with common case variants.
+    # Fallback: match on coupon (analyzed text) if keyword isn't available.
+    if coupon_kw_field and _field_exists(mappings, coupon_kw_field):
+        filters.append({"terms": {coupon_kw_field: ["REDO", "Redo", "redo"]}})
+        coupon_rule_desc = f"{coupon_kw_field} IN ['REDO','Redo','redo']"
+    else:
+        filters.append({"match": {coupon_text_field: "redo"}})
+        coupon_rule_desc = f"match({coupon_text_field}, 'redo')"
+    # ✅ MODIFIED PART END --------------------------------------------------
 
     body: Dict[str, Any] = {
         "size": 0,
@@ -355,9 +347,8 @@ def _es_invoices_with_redo_items(
 
     insight = (
         f"'Invoices with Redo Items' is computed on index '{index_name}' ({window_label}) "
-        f"as the count of distinct invoices where the coupon field contains the word "
-        f"'redo', using '{date_field}' as the invoice date and '{invoice_id_field}' as "
-        "the invoice identifier."
+        f"as the count of distinct invoices where {coupon_rule_desc}, "
+        f"using '{date_field}' as the invoice date and '{invoice_id_field}' as the invoice identifier."
     )
 
     return {
@@ -585,6 +576,12 @@ def _es_top20_customers_with_redo_courtesy(
     top20_info_by_id: Dict[Any, Dict[str, Any]] = {}
     scan_capped = False
 
+    # ✅ MODIFIED PART START ------------------------------------------------
+    # CRITICAL: do NOT sort by _id (ES blocks _id fielddata).
+    # Sort by a real deterministic field that exists: customer_id.
+    safe_customer_sort = [{cust_id_field: "asc"}]
+    # ✅ MODIFIED PART END --------------------------------------------------
+
     for h in _scan_all_hits(
         client,
         index=customers_index,
@@ -592,6 +589,7 @@ def _es_top20_customers_with_redo_courtesy(
         source_fields=["customer_id", "first_name", "last_name", "sales_pickup_lifetime", "sales_pickup_365"],
         page_size=2000,
         max_hits=MAX_TOP20_CUSTOMERS,
+        sort=safe_customer_sort,  # ✅ MODIFIED
     ):
         src = h.get("_source", {}) or {}
         cid = src.get("customer_id")
@@ -734,201 +732,6 @@ def _parse_iso_date_to_date(value: Any) -> Optional[datetime.date]:
     return None
 
 
-def _es_coupon_returns_365d_since_signup(
-    req,
-    client,
-    mappings: Dict[str, Any],  # invoices mappings
-    business_rules: Optional[str],
-):
-    invoices_index = (req.es_index_name or "").strip()
-    customers_index = (req.es_customers_index_name or "").strip()
-
-    if not invoices_index or not customers_index:
-        return _es_cannot_answer(
-            "Coupon Returns requires both invoices and customers indexes.",
-            business_rules,
-        )
-
-    # ✅ DIRECT invoices fields (from your mapping)
-    invoice_customer_field = "customer_id"   # integer
-    invoice_date_field = "dropoff_at"        # date
-    coupon_field = "coupon"                  # text (+ coupon.keyword exists)
-    coupon_total_field = "coupon_total"      # float
-    invoice_id_field = "invoice_id"          # integer
-
-    for f in (invoice_customer_field, invoice_date_field):
-        if not _field_exists(mappings, f):
-            return _es_cannot_answer(
-                f"Cannot compute Coupon Returns because invoices field '{f}' does not exist in mapping.",
-                business_rules,
-            )
-
-    if not (_field_exists(mappings, coupon_field) or _field_exists(mappings, coupon_total_field)):
-        return _es_cannot_answer(
-            "Cannot compute Coupon Returns because neither 'coupon' nor 'coupon_total' exists in invoices mapping.",
-            business_rules,
-        )
-
-    # ✅ customers mapping
-    cust_mapping_raw = client.indices.get_mapping(index=customers_index)
-    cust_props = _extract_properties_from_mapping(cust_mapping_raw, customers_index)
-    cust_mappings = {"properties": cust_props}
-
-    cust_id_field = "customer_id"         # integer
-    signup_field = "original_signup"      # date
-
-    if not _field_exists(cust_mappings, cust_id_field) or not _field_exists(cust_mappings, signup_field):
-        return _es_cannot_answer(
-            "Cannot compute Coupon Returns because 'customer_id' or 'original_signup' missing in customers mapping.",
-            business_rules,
-        )
-
-    # 1) invoices: coupon-bearing customers + first coupon date
-    # windowed by req start/end (keep your behavior)
-    filters, window_label = _date_filters_or_default(req, invoice_date_field)
-
-    coupon_should: List[Dict[str, Any]] = []
-    coupon_kw = _maybe_keyword(mappings, coupon_field) if _field_exists(mappings, coupon_field) else None
-
-    # coupon exists AND not empty (best using coupon.keyword)
-    if coupon_kw:
-        coupon_should.append(
-            {"bool": {"must": [{"exists": {"field": coupon_kw}}], "must_not": [{"term": {coupon_kw: ""}}]}}
-        )
-    elif _field_exists(mappings, coupon_field):
-        coupon_should.append({"exists": {"field": coupon_field}})
-
-    # coupon_total non-zero can also indicate coupon usage
-    if _field_exists(mappings, coupon_total_field):
-        coupon_should.append({"range": {coupon_total_field: {"lt": 0}}})
-        coupon_should.append({"range": {coupon_total_field: {"gt": 0}}})
-
-    filters.append({"bool": {"should": coupon_should, "minimum_should_match": 1}})
-
-    count_field = invoice_id_field if _field_exists(mappings, invoice_id_field) else invoice_date_field
-
-    sub_aggs = {
-        "first_coupon_date": {"min": {"field": invoice_date_field}},
-        "coupon_invoice_count": {"value_count": {"field": count_field}},
-    }
-
-    rows: List[Dict[str, Any]] = []
-    buffer: List[Dict[str, Any]] = []  # [{cid, first_ms, count}]
-    buffer_ids: List[Any] = []
-
-    def flush_buffer():
-        nonlocal buffer, buffer_ids, rows
-        if not buffer:
-            return
-
-        # fetch customers for these ids
-        name_by_id: Dict[Any, str] = {}
-        signup_by_id: Dict[Any, datetime.date] = {}
-
-        for chunk in _chunks(buffer_ids, TERMS_CHUNK_SIZE):
-            body = {
-                "size": 10000,
-                "query": {"bool": {"filter": [{"terms": {cust_id_field: chunk}}]}},
-                "_source": ["customer_id", "first_name", "last_name", "original_signup"],
-            }
-            res = _safe_es_search(client, index=customers_index, body=body)
-            hits = ((res.get("hits") or {}).get("hits") or [])
-            for h in hits:
-                src = h.get("_source", {}) or {}
-                cid = src.get("customer_id")
-                if cid is None:
-                    continue
-                sd = _parse_iso_date_to_date(src.get("original_signup"))
-                if sd:
-                    signup_by_id[cid] = sd
-                first = (src.get("first_name") or "").strip()
-                last = (src.get("last_name") or "").strip()
-                name_by_id[cid] = (f"{first} {last}").strip() or f"Customer {cid}"
-
-        # compute diff
-        for rec in buffer:
-            cid = rec["cid"]
-            signup = signup_by_id.get(cid)
-            if not signup:
-                continue
-            dt = _ms_to_dt(rec["first_ms"])
-            if not dt:
-                continue
-            coupon_date = dt.date()
-            diff_days = (coupon_date - signup).days
-            if diff_days < 365:
-                continue
-
-            rows.append(
-                {
-                    "customer_id": cid,
-                    "customer_name": name_by_id.get(cid, f"Customer {cid}"),
-                    "original_signup": signup.isoformat(),
-                    "first_coupon_visit": coupon_date.isoformat(),
-                    "days_from_signup_to_first_coupon": diff_days,
-                    "coupon_invoice_count": int(rec["count"]),
-                }
-            )
-            if len(rows) >= MAX_ROWS_RETURNED:
-                break
-
-        buffer = []
-        buffer_ids = []
-
-    for b in _composite_by_customer(
-        client,
-        index=invoices_index,
-        filters=filters,
-        customer_field=invoice_customer_field,
-        sub_aggs=sub_aggs,
-        page_size=500,
-        max_pages=MAX_COMPOSITE_PAGES,
-    ):
-        cid = (b.get("key") or {}).get("cid")
-        if cid is None:
-            continue
-
-        first_ms = (b.get("first_coupon_date") or {}).get("value")
-        if not first_ms:
-            continue
-
-        count = int((b.get("coupon_invoice_count") or {}).get("value") or 0)
-
-        buffer.append({"cid": cid, "first_ms": first_ms, "count": count})
-        buffer_ids.append(cid)
-
-        if len(buffer_ids) >= TERMS_CHUNK_SIZE:
-            flush_buffer()
-            if len(rows) >= MAX_ROWS_RETURNED:
-                break
-
-    flush_buffer()
-
-    if not rows:
-        return {
-            "insight": to_json_safe(
-                "No customers found where the first coupon-bearing invoice is 365+ days after signup "
-                f"({window_label})."
-            ),
-            "rows": [],
-            "rules_used": business_rules or "",
-            "engine": "es",
-        }
-
-    rows.sort(key=lambda r: r.get("days_from_signup_to_first_coupon", 0), reverse=True)
-
-    insight = (
-        "Coupon Returns (365+ Days Since Signup) computed using invoices.customer_id + invoices.dropoff_at "
-        "and customers.original_signup. "
-        f"Matched {len(rows)} customers ({window_label})."
-    )
-
-    return {
-        "insight": to_json_safe(insight),
-        "rows": to_json_safe(rows),
-        "rules_used": business_rules or "",
-        "engine": "es",
-    }
 def _es_incoming_sales(
     req,
     client,
@@ -942,7 +745,6 @@ def _es_incoming_sales(
     - Extra: invoice_count (value_count(invoice_id))
     - Always returns 1 metric row (0.0 if no data)
     """
-
     index_name = (getattr(req, "es_index_name", "") or "").strip()
     if not index_name:
         return _es_cannot_answer("Incoming Sales requires invoices index (es_index_name).", business_rules)
@@ -1003,6 +805,8 @@ def _es_incoming_sales(
         "rules_used": business_rules or "",
         "engine": "es",
     }
+
+
 def _es_incoming_pieces(
     req,
     client,
@@ -1016,7 +820,6 @@ def _es_incoming_pieces(
     - Extra: invoice_count (value_count(invoice_id))
     - Always returns 1 metric row (0.0 if no data)
     """
-
     index_name = (getattr(req, "es_index_name", "") or "").strip()
     if not index_name:
         return _es_cannot_answer("Incoming Pieces requires invoices index (es_index_name).", business_rules)
@@ -1076,6 +879,8 @@ def _es_incoming_pieces(
         "rules_used": business_rules or "",
         "engine": "es",
     }
+
+
 def _es_outgoing_sales(
     req,
     client,
@@ -1089,7 +894,6 @@ def _es_outgoing_sales(
     - Extra: invoice_count (value_count(invoice_id))
     - Always returns 1 metric row (0.0 if no data)
     """
-
     index_name = (getattr(req, "es_index_name", "") or "").strip()
     if not index_name:
         return _es_cannot_answer("Outgoing Sales requires invoices index (es_index_name).", business_rules)
@@ -1155,7 +959,6 @@ __all__ = [
     "_es_invoices_with_redo_items",
     "_es_avg_pickup_delay_retail",
     "_es_top20_customers_with_redo_courtesy",
-    "_es_coupon_returns_365d_since_signup",
     "_es_incoming_sales",
     "_es_incoming_pieces",
     "_es_outgoing_sales",

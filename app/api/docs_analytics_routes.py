@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any, Iterable
+from typing import List, Optional, Dict, Any, Iterable, Literal
 from copy import deepcopy
 
 from fastapi import APIRouter, HTTPException
@@ -21,6 +21,10 @@ from routes.es_test import (
     _extract_properties_from_mapping,
     _parse_es_dsl,
     _flatten_docs_to_rows,
+)
+from app.api.metrics.shared_utilities import (
+    _field_exists,
+    _safe_es_search,
 )
 
 router = APIRouter(prefix="/docs", tags=["Docs Analytics"])
@@ -59,41 +63,6 @@ CUSTOMER_FIELDS: Dict[str, str] = {
 }
 
 
-def _field_exists(mappings: Dict[str, Any], field: str) -> bool:
-    """
-    Works with:
-      - flat dict from _extract_properties_from_mapping (keys are field paths), OR
-      - nested ES mapping style dict.
-    """
-    props = (mappings or {}).get("properties") or {}
-    if not isinstance(props, dict) or not field:
-        return False
-
-    # flat case
-    if field in props:
-        return True
-
-    # nested traversal case for "a.b.c"
-    node: Any = props
-    parts = field.split(".")
-    for part in parts:
-        if not isinstance(node, dict):
-            return False
-
-        # typical nested mapping: node[part] is field spec
-        if part in node:
-            spec = node[part]
-        # sometimes node is a spec with "properties"
-        elif "properties" in node and isinstance(node["properties"], dict) and part in node["properties"]:
-            spec = node["properties"][part]
-        else:
-            return False
-
-        node = spec
-
-    return True
-
-
 # -------------------------------------------------------------------
 # Request models
 # -------------------------------------------------------------------
@@ -122,6 +91,9 @@ class DocsAnalyticsRequest(BaseModel):
     es_customers_index_name: Optional[str] = None
     es_customer_stats_index_name: Optional[str] = None
 
+    # ✅ NEW: used by some metrics (eg one-time vs repeat) via getattr(req, "repeat_basis", ...)
+    repeat_basis: Optional[str] = None
+
 
 class Period(BaseModel):
     start_date: str
@@ -143,6 +115,9 @@ class MetricsDashboardRequest(BaseModel):
     current: Period
     previous: Optional[Period] = None
 
+    # ✅ UPDATED: dashboard selector
+    dashboard_id: Literal["performance", "ops", "lifecycle", "growth"] = "performance"
+
 
 class MetricsDashboardMetric(BaseModel):
     id: str
@@ -153,18 +128,15 @@ class MetricsDashboardMetric(BaseModel):
     es_customer_stats_index_name: Optional[str] = None
 
 
-# -------------------------------------------------------------------
-# ES-safe helpers (timeouts + composite pagination)
-# -------------------------------------------------------------------
-
-def _safe_es_search(client, *, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
+class DashboardDataset(BaseModel):
     """
-    ES search wrapper with conservative timeouts (prod-safe).
+    Non-KPI outputs: charts/tables.
     """
-    body = dict(body or {})
-    body.setdefault("timeout", "10s")
-    body.setdefault("track_total_hits", False)
-    return client.search(index=index, body=body, request_timeout=20)
+    id: str
+    label: str
+    rows: Any
+    insight: str
+    engine: str = "es"
 
 
 def _composite_terms(
@@ -381,6 +353,7 @@ def _maybe_prefer_keyword(
 
     kw_key = (resolved + ".keyword").lower()
     return lower_map.get(kw_key) or resolved
+
 
 # -------------------------------------------------------------------
 # ES mapping + date helpers (shared by metric modules)
@@ -789,14 +762,6 @@ def _route_es_special(
     if "redo" in q_lower and "invoice" in q_lower:
         return metrics_promos_coupons._es_invoices_with_redo_items(req, client, mappings, business_rules)
 
-    if (
-        "coupon" in q_lower
-        and ("return" in q_lower or "returns" in q_lower)
-        and "365" in q_lower
-        and "signup" in q_lower
-    ):
-        return metrics_promos_coupons._es_coupon_returns_365d_since_signup(req, client, mappings, business_rules)
-
     # ============================================================
     # ✅ NEW: Segmentation / Pricing / Route vs Retail / Tiers
     # ============================================================
@@ -1028,10 +993,6 @@ def _route_es_special(
 
     if "overdue for their next visit" in q_lower or "overdue for next visit" in q_lower:
         return metrics_lifecycle._es_overdue_customers(req, client, mappings, business_rules)
-
-    if "lapsed customers" in q_lower or (">180 days" in q_lower and "last visit" in q_lower):
-        return metrics_lifecycle._es_lapsed_customers(req, client, mappings, business_rules)
-
     # Keep generic visit-frequency handler AFTER the explicit 365/730 ones
     if "distribution of customers by visit frequency" in q_lower or (
         "visit frequency" in q_lower and "1, 2–5, 6–11, 12+" in q_lower
@@ -1097,6 +1058,7 @@ def _route_es_special(
         return metrics_time_series._es_yoy_revenue_by_location(req, client, mappings, business_rules)
 
     return None
+
 
 # -------------------------------------------------------------------
 # ES path: question -> (special ES or DSL) -> ES -> rows
@@ -1243,20 +1205,425 @@ def _ask_via_python(req: DocsAnalyticsRequest):
 
 
 # -------------------------------------------------------------------
-# Dashboard endpoint
+# ✅ Dashboard helpers (now supports: performance, ops, lifecycle, growth)
+# -------------------------------------------------------------------
+
+def _pct_change(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
+    if cur is None or prev in (None, 0):
+        return None
+    try:
+        return (float(cur) - float(prev)) * 100.0 / float(prev)
+    except Exception:
+        return None
+
+
+PERFORMANCE_LABEL_MAP: Dict[str, str] = {
+    "total_visits": "Total Visits",
+    "unique_customers": "Unique Customers",
+    "total_revenue": "Total Visit Amount",
+    "total_pieces": "Total Visit Pieces",
+    "average_visits_per_customer": "Average Visits per Customer",
+    "visit_pieces_per_customer": "Visit Pieces per Customer",
+    "revenue_per_customer": "Revenue Per Customer",
+    "avg_dollar_per_piece": "Avg $ per Piece",
+    "initial_visit_amount": "Initial Visit – Amount",
+    "initial_visit_pieces": "Initial Visit – Pieces",
+    "new_customer_acquisition_rate": "New Customer Acquisition",
+    "new_customer_30d_return_rate": "New Customer 30-Day Return Rate",
+    "customers_2plus_visits": "Customers Achieving 2nd Visit",
+    "customers_3plus_visits": "Customers Achieving 3rd Visit",
+    "customers_4plus_visits": "Customers Achieving 4th Visit",
+    "customers_5plus_visits": "Customers Achieving 5th Visit",
+}
+
+OPS_LABEL_MAP: Dict[str, str] = {
+    "avg_pickup_delay_retail": "Average Pickup Delay (Retail)",
+    "redo_invoices_count": "Invoices with Redo Items",
+    "top20_customers_redo_issues": "Top 20% Customers – Redo Issues",
+}
+
+# ✅ NEW
+LIFECYCLE_LABEL_MAP: Dict[str, str] = {
+    "active_customers": "Active Customers",
+    "active_customer_rate": "Active Customer Rate (%)",
+    "activity_rate_30d": "30-Day Activity Rate (%)",
+    "churn_rate": "Churn Rate (%)",
+    "customer_retention_rate_730_180": "Retention Rate (730 → 180)",
+    "avg_customer_lifespan": "Average Customer Lifespan (days)",
+    "avg_visit_interval": "Average Visit Interval (days)",
+    "repeat_customers_365": "Repeat Customers (365 days)",
+    "single_visit_lifetime": "Single-Visit Customers (Lifetime) (%)",
+    "single_visit_365": "Single-Visit Customers (365 days) (%)",
+    "avg_days_between_visits_active": "Avg Days Between Visits (Active)",
+    "overdue_customers": "Overdue Customers",
+}
+
+# ✅ NEW (keep small; most are datasets)
+GROWTH_LABEL_MAP: Dict[str, str] = {
+    "pareto_80_20": "Pareto 80/20 (Customer share for 80% revenue)",
+}
+
+LABEL_MAPS: Dict[str, Dict[str, str]] = {
+    "performance": PERFORMANCE_LABEL_MAP,
+    "ops": OPS_LABEL_MAP,
+    "lifecycle": LIFECYCLE_LABEL_MAP,
+    "growth": GROWTH_LABEL_MAP,
+}
+
+
+# ✅ NEW: scalar extractor (so lifecycle/growth KPI tiles can work even if rows are dict/list)
+def _extract_scalar(resp: Any) -> Optional[float]:
+    if not isinstance(resp, dict):
+        return None
+
+    rows = resp.get("rows")
+
+    if isinstance(rows, (int, float)):
+        return float(rows)
+
+    if isinstance(rows, dict):
+        for k in ("value", "count", "rate", "pct", "percentage"):
+            v = rows.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        nums = [v for v in rows.values() if isinstance(v, (int, float))]
+        return float(nums[0]) if len(nums) == 1 else None
+
+    if isinstance(rows, list) and rows:
+        r0 = rows[0]
+        if isinstance(r0, (int, float)):
+            return float(r0)
+        if isinstance(r0, dict):
+            for k in ("value", "count", "rate", "pct", "percentage"):
+                v = r0.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+            nums = [v for v in r0.values() if isinstance(v, (int, float))]
+            return float(nums[0]) if len(nums) == 1 else None
+
+    return None
+
+
+# ✅ NEW: dashboard KPI window router
+def _window_kpis_for_dashboard(
+    dashboard_id: str,
+    *,
+    base_docs_req: DocsAnalyticsRequest,
+    period: Period,
+    client,
+    mappings: Dict[str, Any],
+) -> Dict[str, float]:
+    from app.api.metrics import metrics_customer_value, metrics_lifecycle
+
+    # Keep existing fast windowed performance/ops
+    if dashboard_id in ("performance", "ops"):
+        vals = metrics_customer_value._window_customer_value_metrics(base_docs_req, period, client, mappings)
+        out: Dict[str, float] = {}
+        for k, v in (vals or {}).items():
+            if isinstance(v, (int, float)):
+                out[k] = float(v)
+        return out
+
+    # For lifecycle/growth, call individual metrics and try extract scalar
+    reqp = base_docs_req.model_copy(update={"start_date": period.start_date, "end_date": period.end_date})
+    out: Dict[str, float] = {}
+
+    if dashboard_id == "lifecycle":
+        candidates = {
+            "active_customers": metrics_lifecycle._es_active_customers(reqp, client, mappings, None),
+            "active_customer_rate": metrics_lifecycle._es_active_customer_rate(reqp, client, mappings, None),
+            "activity_rate_30d": metrics_lifecycle._es_30d_activity_rate(reqp, client, mappings, None),
+            "churn_rate": metrics_lifecycle._es_churn_rate(reqp, client, mappings, None),
+            "customer_retention_rate_730_180": metrics_lifecycle._es_customer_retention_rate_730_180(reqp, client, mappings, None),
+            "avg_customer_lifespan": metrics_lifecycle._es_avg_customer_lifespan(reqp, client, mappings, None),
+            "avg_visit_interval": metrics_lifecycle._es_avg_visit_interval(reqp, client, mappings, None),
+            "repeat_customers_365": metrics_lifecycle._es_repeat_customers_365(reqp, client, mappings, None),
+            "single_visit_lifetime": metrics_lifecycle._es_single_visit_lifetime(reqp, client, mappings, None),
+            "single_visit_365": metrics_lifecycle._es_single_visit_365(reqp, client, mappings, None),
+            "avg_days_between_visits_active": metrics_lifecycle._es_avg_days_between_visits_active(reqp, client, mappings, None),
+            "overdue_customers": metrics_lifecycle._es_overdue_customers(reqp, client, mappings, None),
+        }
+        for k, resp in candidates.items():
+            v = _extract_scalar(resp)
+            if isinstance(v, (int, float)):
+                out[k] = float(v)
+
+    elif dashboard_id == "growth":
+        v = _extract_scalar(metrics_lifecycle._es_pareto_80_20(reqp, client, mappings, None))
+        if isinstance(v, (int, float)):
+            out["pareto_80_20"] = float(v)
+
+    return out
+
+
+def _build_datasets(
+    dashboard_id: str,
+    *,
+    base_docs_req: DocsAnalyticsRequest,
+    current_period: Period,
+    client,
+    mappings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Return non-KPI datasets for the selected dashboard (charts/tables).
+    """
+    from app.api.metrics import (
+        metrics_time_series,
+        metrics_promos_coupons,
+        metrics_customer_value,
+        metrics_lifecycle,
+    )
+
+    req_current = base_docs_req.model_copy(
+        update={
+            "start_date": current_period.start_date,
+            "end_date": current_period.end_date,
+        }
+    )
+
+    datasets: List[Dict[str, Any]] = []
+
+    if dashboard_id == "performance":
+        # Chart/Table: MoM Visits
+        mom = metrics_time_series._es_month_over_month_visits(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="month_over_month_visits",
+                label="Month-over-Month Visits",
+                rows=to_json_safe(mom.get("rows", [])),
+                insight=str(mom.get("insight", "")),
+                engine=str(mom.get("engine", "es")),
+            ).model_dump()
+        )
+
+        # Chart/Table: Seasonal revenue patterns
+        seasonal = metrics_time_series._es_seasonal_revenue_patterns(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="seasonal_revenue_patterns",
+                label="Seasonal Revenue Patterns",
+                rows=to_json_safe(seasonal.get("rows", [])),
+                insight=str(seasonal.get("insight", "")),
+                engine=str(seasonal.get("engine", "es")),
+            ).model_dump()
+        )
+
+        # Table: One-time vs repeat (uses repeat_basis if implemented in metric)
+        seg_req = base_docs_req.model_copy(update={"repeat_basis": "365"})
+        one_time = metrics_customer_value._es_one_time_vs_repeat(seg_req, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="one_time_vs_repeat",
+                label="One-Time vs Repeat Customers",
+                rows=to_json_safe(one_time.get("rows", [])),
+                insight=str(one_time.get("insight", "")),
+                engine=str(one_time.get("engine", "es")),
+            ).model_dump()
+        )
+
+    elif dashboard_id == "ops":
+        # Table: Top redo/courtesy issues
+        top = metrics_promos_coupons._es_top20_customers_with_redo_courtesy(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="top20_customers_redo_issues",
+                label="Top Customers – Redo/Courtesy Issues",
+                rows=to_json_safe(top.get("rows", [])),
+                insight=str(top.get("insight", "")),
+                engine=str(top.get("engine", "es")),
+            ).model_dump()
+        )
+
+        # ✅ extra ops datasets (optional, kept additive)
+        redo = metrics_promos_coupons._es_invoices_with_redo_items(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="redo_invoices",
+                label="Invoices with Redo Items",
+                rows=to_json_safe(redo.get("rows", [])),
+                insight=str(redo.get("insight", "")),
+                engine=str(redo.get("engine", "es")),
+            ).model_dump()
+        )
+        delay = metrics_promos_coupons._es_avg_pickup_delay_retail(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="avg_pickup_delay_retail",
+                label="Average Pickup Delay (Retail)",
+                rows=to_json_safe(delay.get("rows", [])),
+                insight=str(delay.get("insight", "")),
+                engine=str(delay.get("engine", "es")),
+            ).model_dump()
+        )
+
+    elif dashboard_id == "lifecycle":
+        dist = metrics_lifecycle._es_days_since_last_visit_distribution(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="days_since_last_visit_distribution",
+                label="Days Since Last Visit Distribution",
+                rows=to_json_safe(dist.get("rows", [])),
+                insight=str(dist.get("insight", "")),
+                engine=str(dist.get("engine", "es")),
+            ).model_dump()
+        )
+
+        vf = metrics_lifecycle._es_visit_frequency_distribution(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="visit_frequency_distribution",
+                label="Visit Frequency Distribution",
+                rows=to_json_safe(vf.get("rows", [])),
+                insight=str(vf.get("insight", "")),
+                engine=str(vf.get("engine", "es")),
+            ).model_dump()
+        )
+
+        vf365 = metrics_lifecycle._es_visit_frequency_365(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="visit_frequency_365",
+                label="Visit Frequency (365 Days)",
+                rows=to_json_safe(vf365.get("rows", [])),
+                insight=str(vf365.get("insight", "")),
+                engine=str(vf365.get("engine", "es")),
+            ).model_dump()
+        )
+
+        vf730 = metrics_lifecycle._es_visit_frequency_730(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="visit_frequency_730",
+                label="Visit Frequency (730 Days)",
+                rows=to_json_safe(vf730.get("rows", [])),
+                insight=str(vf730.get("insight", "")),
+                engine=str(vf730.get("engine", "es")),
+            ).model_dump()
+        )
+
+        nth = metrics_lifecycle._es_customers_nth_visit(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="customers_nth_visit",
+                label="Customers Achieving Nth Visit",
+                rows=to_json_safe(nth.get("rows", [])),
+                insight=str(nth.get("insight", "")),
+                engine=str(nth.get("engine", "es")),
+            ).model_dump()
+        )
+
+        top_rev = metrics_lifecycle._es_top_customers_by_revenue(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="top_customers_by_revenue",
+                label="Top Customers by Revenue",
+                rows=to_json_safe(top_rev.get("rows", [])),
+                insight=str(top_rev.get("insight", "")),
+                engine=str(top_rev.get("engine", "es")),
+            ).model_dump()
+        )
+
+    elif dashboard_id == "growth":
+        acq = metrics_lifecycle._es_daily_acquisition_rate_by_period_customers(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="daily_acquisition_rate_by_period",
+                label="Daily Acquisition Rate (by Period)",
+                rows=to_json_safe(acq.get("rows", [])),
+                insight=str(acq.get("insight", "")),
+                engine=str(acq.get("engine", "es")),
+            ).model_dump()
+        )
+
+        yoy = metrics_lifecycle._es_yoy_new_customers_customers_index(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="yoy_new_customers",
+                label="YoY New Customers",
+                rows=to_json_safe(yoy.get("rows", [])),
+                insight=str(yoy.get("insight", "")),
+                engine=str(yoy.get("engine", "es")),
+            ).model_dump()
+        )
+
+        cohort = metrics_lifecycle._es_return_rate_by_cohort_year_customers(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="return_rate_by_cohort_year",
+                label="Return Rate by Cohort Year",
+                rows=to_json_safe(cohort.get("rows", [])),
+                insight=str(cohort.get("insight", "")),
+                engine=str(cohort.get("engine", "es")),
+            ).model_dump()
+        )
+
+        rv = metrics_lifecycle._es_route_vs_retail_comparison(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="route_vs_retail_comparison",
+                label="Route vs Retail Comparison",
+                rows=to_json_safe(rv.get("rows", [])),
+                insight=str(rv.get("insight", "")),
+                engine=str(rv.get("engine", "es")),
+            ).model_dump()
+        )
+
+        tiers = metrics_lifecycle._es_customer_value_tiers(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="customer_value_tiers",
+                label="Customer Value Tiers",
+                rows=to_json_safe(tiers.get("rows", [])),
+                insight=str(tiers.get("insight", "")),
+                engine=str(tiers.get("engine", "es")),
+            ).model_dump()
+        )
+
+        seg = metrics_lifecycle._es_price_segments_by_avg_visit_value(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="price_segments_by_avg_visit_value",
+                label="Price Segments (Avg Visit Value)",
+                rows=to_json_safe(seg.get("rows", [])),
+                insight=str(seg.get("insight", "")),
+                engine=str(seg.get("engine", "es")),
+            ).model_dump()
+        )
+
+        targets = metrics_lifecycle._es_high_value_retail_targets(req_current, client, mappings, None)
+        datasets.append(
+            DashboardDataset(
+                id="high_value_retail_targets",
+                label="High-Value Retail Targets",
+                rows=to_json_safe(targets.get("rows", [])),
+                insight=str(targets.get("insight", "")),
+                engine=str(targets.get("engine", "es")),
+            ).model_dump()
+        )
+
+    return datasets
+
+
+# -------------------------------------------------------------------
+# ✅ Dashboard endpoint (supports four dashboards)
 # -------------------------------------------------------------------
 @router.post("/dashboard")
 def es_dashboard(req: MetricsDashboardRequest):
     if not req.es_base_url or not req.es_index_name:
         raise HTTPException(status_code=400, detail="es_base_url and es_index_name are required")
 
-    from app.api.metrics import metrics_customer_value
+    dashboard_id = (req.dashboard_id or "performance").strip().lower()
+    if dashboard_id not in ("performance", "ops", "lifecycle", "growth"):
+        raise HTTPException(
+            status_code=400,
+            detail="dashboard_id must be 'performance', 'ops', 'lifecycle', or 'growth'",
+        )
 
     client = make_es_client(req.es_base_url, req.es_username, req.es_password)
     if not client.ping():
         raise HTTPException(status_code=400, detail=f"Could not ping Elasticsearch at {req.es_base_url}")
 
-    # ✅ FIX: choose ONE concrete invoices index + mapping (handles alias/wildcards safely)
+    # ✅ choose ONE concrete invoices index + mapping (handles alias/wildcards safely)
     chosen_index, chosen_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
     properties = _extract_properties_from_mapping(chosen_mapping, chosen_index)
     mappings = {"properties": properties}
@@ -1268,73 +1635,89 @@ def es_dashboard(req: MetricsDashboardRequest):
         es_base_url=req.es_base_url,
         es_username=req.es_username,
         es_password=req.es_password,
-        es_index_name=chosen_index,  # ✅ FIX
+        es_index_name=chosen_index,
         es_customers_index_name=req.es_customers_index_name,
         es_customer_stats_index_name=req.es_customer_stats_index_name,
     )
 
-    current_vals = metrics_customer_value._window_customer_value_metrics(
-        base_docs_req, req.current, client, mappings
+    current_vals = _window_kpis_for_dashboard(
+        dashboard_id,
+        base_docs_req=base_docs_req,
+        period=req.current,
+        client=client,
+        mappings=mappings,
     )
 
     previous_vals: Dict[str, float] = {}
     if req.previous:
-        previous_vals = metrics_customer_value._window_customer_value_metrics(
-            base_docs_req, req.previous, client, mappings
+        previous_vals = _window_kpis_for_dashboard(
+            dashboard_id,
+            base_docs_req=base_docs_req,
+            period=req.previous,
+            client=client,
+            mappings=mappings,
         )
 
-    label_map = {
-        "total_visits": "Total Visits",
-        "unique_customers": "Unique Customers",
-        "total_revenue": "Total Visit Amount",
-        "total_pieces": "Total Visit Pieces",
-        "average_visits_per_customer": "Average Visits per Customer",
-        "visit_pieces_per_customer": "Visit Pieces per Customer",
-        "revenue_per_customer": "Revenue Per Customer",
-        "avg_dollar_per_piece": "Avg $ per Piece",
-        "initial_visit_amount": "Initial Visit – Amount",
-        "initial_visit_pieces": "Initial Visit – Pieces",
-        "avg_pickup_delay_retail": "Average Pickup Delay (Retail)",
-        "redo_invoices_count": "Invoices with Redo Items",
-        "new_customer_acquisition_rate": "New Customer Acquisition",
-        "new_customer_30d_return_rate": "New Customer 30-Day Return Rate",
-        "customers_2plus_visits": "Customers Achieving 2nd Visit",
-        "customers_3plus_visits": "Customers Achieving 3rd Visit",
-        "customers_4plus_visits": "Customers Achieving 4th Visit",
-        "customers_5plus_visits": "Customers Achieving 5th Visit",
-        "top20_customers_redo_issues": "Top 20% Customers – Redo Issues",
-        "coupon_returns_365d_since_signup": "Coupon Returns (365 Days Since Signup)",
-    }
+    label_map = LABEL_MAPS.get(dashboard_id) or {}
 
     metrics: List[MetricsDashboardMetric] = []
-
     for metric_id, label in label_map.items():
         cur = current_vals.get(metric_id)
-        prev = previous_vals.get(metric_id)
-        change = None
-        if cur is not None and prev not in (None, 0):
-            try:
-                change = (cur - prev) * 100.0 / float(prev)
-            except Exception:
-                change = None
+        prev = previous_vals.get(metric_id) if req.previous else None
 
         metrics.append(
             MetricsDashboardMetric(
                 id=metric_id,
                 label=label,
-                current=cur,
-                previous=prev,
-                change_pct=change,
+                current=float(cur) if cur is not None else None,
+                previous=float(prev) if prev is not None else None,
+                change_pct=_pct_change(cur, prev),
             )
         )
 
+    # ✅ datasets (charts/tables)
+    datasets = _build_datasets(
+        dashboard_id,
+        base_docs_req=base_docs_req,
+        current_period=req.current,
+        client=client,
+        mappings=mappings,
+    )
+
     return {
+        "dashboard_id": dashboard_id,
         "current_period": {"start_date": req.current.start_date, "end_date": req.current.end_date},
         "previous_period": (
             {"start_date": req.previous.start_date, "end_date": req.previous.end_date} if req.previous else None
         ),
         "metrics": [m.model_dump() for m in metrics],
+        "datasets": datasets,
     }
+
+
+@router.post("/dashboard/performance")
+def es_dashboard_performance(req: MetricsDashboardRequest):
+    req2 = req.model_copy(update={"dashboard_id": "performance"})
+    return es_dashboard(req2)
+
+
+@router.post("/dashboard/ops")
+def es_dashboard_ops(req: MetricsDashboardRequest):
+    req2 = req.model_copy(update={"dashboard_id": "ops"})
+    return es_dashboard(req2)
+
+
+# ✅ NEW endpoints (additive)
+@router.post("/dashboard/lifecycle")
+def es_dashboard_lifecycle(req: MetricsDashboardRequest):
+    req2 = req.model_copy(update={"dashboard_id": "lifecycle"})
+    return es_dashboard(req2)
+
+
+@router.post("/dashboard/growth")
+def es_dashboard_growth(req: MetricsDashboardRequest):
+    req2 = req.model_copy(update={"dashboard_id": "growth"})
+    return es_dashboard(req2)
 
 
 # -------------------------------------------------------------------
