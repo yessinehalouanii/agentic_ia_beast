@@ -1,50 +1,42 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 
 from abi.runtime import to_json_safe
-from app.api.metrics.metrics_promos_coupons import _date_filters_or_default
-from routes.es_test import _extract_properties_from_mapping
 from app.api.metrics.shared_utilities import (
     _field_exists,
     _safe_es_search,
+    _get_invoice_index_and_mappings,  # ✅ reuse-aware helper
 )
 from app.api.docs_analytics_routes import (
     _ms_to_dt,
     _es_cannot_answer,
     _build_date_range_filter,
-    _select_invoice_index_from_es_mapping,
 )
 
-# -------------------------------------------------------------------
-# Mapping helpers (NO resolver / exact field names)
-# -------------------------------------------------------------------
-def _pick_keyword_or_base(mappings: Dict[str, Any], base: str) -> Optional[str]:
-    """
-    Prefer base.keyword if it exists, else base if it exists, else None.
-    """
-    kw = f"{base}.keyword"
-    if _field_exists(mappings, kw):
-        return kw
-    if _field_exists(mappings, base):
-        return base
-    return None
 
-
-def _get_invoice_index_and_mappings(client, es_index_name: str) -> tuple[str, Dict[str, Any]]:
+def _invoice_index_and_mappings(
+    client,
+    index_in: str,
+    mappings: Optional[Dict[str, Any]],
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Resolve the real invoices index (handles aliases) and extract its properties mapping.
+    ✅ NEW: Always use shared utility so we:
+      - reuse provided mappings if already fetched (dashboard path)
+      - otherwise resolve alias/wildcard to a concrete index + fetch mappings once (ask-analytics path)
     """
-    invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, es_index_name)
-    props = _extract_properties_from_mapping(invoice_mapping, invoice_index)
-    return invoice_index, {"properties": props}
+    return _get_invoice_index_and_mappings(
+        client,
+        index_in,
+        existing_mappings=mappings,
+        existing_index=index_in,
+    )
 
 
 # -------------------------------------------------------------------
-# ES-safe helpers (timeout + pagination + safety caps)
+# Window helpers (single approach used by all metrics here)
 # -------------------------------------------------------------------
-
 class _WindowReq:
     """
     Wrapper that injects start_date/end_date without mutating the original req.
@@ -61,9 +53,8 @@ class _WindowReq:
 
 def _with_default_window(req: Any, *, default_days: int) -> Any:
     """
-    If req has neither start_date nor end_date, apply a safe default window:
+    If req has neither start_date nor end_date, apply:
       [today-default_days, today]
-    Returns either req (unchanged) or a wrapper with injected dates.
     """
     has_start = bool(getattr(req, "start_date", None))
     has_end = bool(getattr(req, "end_date", None))
@@ -74,10 +65,22 @@ def _with_default_window(req: Any, *, default_days: int) -> Any:
     start = today - timedelta(days=default_days)
     return _WindowReq(req, start_date=start.isoformat(), end_date=today.isoformat())
 
+
+def _window_label(reqw: Any, *, default_days: int) -> str:
+    s = getattr(reqw, "start_date", None)
+    e = getattr(reqw, "end_date", None)
+    if s and e:
+        return f"{s} → {e}"
+    if s:
+        return f"since {s}"
+    if e:
+        return f"until {e}"
+    return f"last {default_days} days"
+
+
 # -------------------------------------------------------------------
 # Metrics
 # -------------------------------------------------------------------
-
 def _es_month_over_month_visits(
     req,
     client,
@@ -87,51 +90,47 @@ def _es_month_over_month_visits(
     """
     Month-over-month visit volume trend based on ES date_histogram by month.
 
-    ✅ Uses direct fields:
+    Uses:
       - dropoff_at
-      - visit_id(.keyword) if present (else falls back to doc_count)
+      - cardinality(visit_id) per month
     """
-    index_in = (req.es_index_name or "").strip()
+    index_in = (getattr(req, "es_index_name", "") or "").strip()
     if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
+    index_name, idx_mappings = _invoice_index_and_mappings(client, index_in, mappings)
 
     date_field = "dropoff_at"
     if not _field_exists(idx_mappings, date_field):
         return _es_cannot_answer(
-            "Cannot compute month-over-month visits because required field 'dropoff_at' is missing from the invoices mapping.",
+            "Cannot compute month-over-month visits because required field 'dropoff_at' "
+            "is missing from the invoices mapping.",
             business_rules,
         )
 
-    visit_field = _pick_keyword_or_base(idx_mappings, "visit_id")
-    has_visit_field = bool(visit_field)
+    visit_field = "visit_id"
+    if not _field_exists(idx_mappings, visit_field):
+        return _es_cannot_answer(
+            "Cannot compute month-over-month visits because required field 'visit_id' "
+            "is missing from the invoices mapping.",
+            business_rules,
+        )
 
-    # ✅ default window (~13 months)
+    # default window (~13 months)
     reqw = _with_default_window(req, default_days=400)
 
     filters = _build_date_range_filter(reqw, date_field) or []
     query = {"bool": {"filter": filters}} if filters else None
 
-    months_agg: Dict[str, Any] = {
-        "date_histogram": {
-            "field": date_field,
-            "calendar_interval": "month",
-        }
-    }
-
-    if has_visit_field:
-        precision = int(getattr(req, "cardinality_precision", 4000) or 4000)
-        months_agg["aggs"] = {
-            "distinct_visits": {
-                "cardinality": {
-                    "field": visit_field,
-                    "precision_threshold": precision,
-                }
+    body: Dict[str, Any] = {
+        "size": 0,
+        "aggs": {
+            "months": {
+                "date_histogram": {"field": date_field, "calendar_interval": "month"},
+                "aggs": {"distinct_visits": {"cardinality": {"field": visit_field}}},
             }
-        }
-
-    body: Dict[str, Any] = {"size": 0, "aggs": {"months": months_agg}}
+        },
+    }
     if query:
         body["query"] = query
 
@@ -143,12 +142,7 @@ def _es_month_over_month_visits(
         dt = _ms_to_dt(b.get("key"))
         if not dt:
             continue
-
-        if has_visit_field:
-            visit_count = int(((b.get("distinct_visits") or {}).get("value")) or 0)
-        else:
-            visit_count = int(b.get("doc_count") or 0)
-
+        visit_count = int(((b.get("distinct_visits") or {}).get("value")) or 0)
         rows.append({"month": dt.date().isoformat(), "visit_count": visit_count})
 
     rows.sort(key=lambda r: r["month"])
@@ -189,25 +183,26 @@ def _es_seasonal_revenue_patterns(
     """
     Seasonal revenue patterns vs last year using monthly date_histogram + sum(total).
 
-    ✅ Uses direct fields:
+    Uses:
       - dropoff_at
       - total
     """
-    index_in = (req.es_index_name or "").strip()
+    index_in = (getattr(req, "es_index_name", "") or "").strip()
     if not index_in:
         return _es_cannot_answer("Missing es_index_name.", business_rules)
 
-    index_name, idx_mappings = _get_invoice_index_and_mappings(client, index_in)
+    index_name, idx_mappings = _invoice_index_and_mappings(client, index_in, mappings)
 
     date_field = "dropoff_at"
     amount_field = "total"
     if not _field_exists(idx_mappings, date_field) or not _field_exists(idx_mappings, amount_field):
         return _es_cannot_answer(
-            "Cannot compute seasonal revenue patterns because required fields 'dropoff_at' and/or 'total' are missing from the invoices mapping.",
+            "Cannot compute seasonal revenue patterns because required fields 'dropoff_at' "
+            "and/or 'total' are missing from the invoices mapping.",
             business_rules,
         )
 
-    # ✅ default window (~26 months)
+    # default window (~26 months)
     reqw = _with_default_window(req, default_days=800)
 
     filters = _build_date_range_filter(reqw, date_field) or []
@@ -312,46 +307,38 @@ def _es_seasonal_revenue_patterns(
     }
 
 
-def _es_dropoff_visits(
-    req,
-    client,
-    mappings: Dict[str, Any],  # invoices mapping: {"properties": ...}
-    business_rules: Optional[str],
-):
-    """
-    Dropoff Visits (Invoices)
-    - Windowed by: dropoff_at
-    - Definition: DISTINCT visits at drop-off time
-    - Implementation: cardinality(visit_id)  ✅ (approx, fast, 1 request)
-    - Extras:
-        - invoice_count: value_count(invoice_id)
-        - unique_customers: cardinality(customer_id)
-    - Always returns 1 metric row (0 when no data)
-    """
-
-    index_name = (getattr(req, "es_index_name", "") or "").strip()
-    if not index_name:
+def _es_dropoff_visits(req, client, mappings: Dict[str, Any], business_rules: Optional[str]):
+    index_in = (getattr(req, "es_index_name", "") or "").strip()
+    if not index_in:
         return _es_cannot_answer("Dropoff Visits requires invoices index (es_index_name).", business_rules)
+
+    index_name, idx_mappings = _invoice_index_and_mappings(client, index_in, mappings)
 
     date_field = "dropoff_at"
     visit_id_field = "visit_id"
     invoice_id_field = "invoice_id"
     customer_id_field = "customer_id"
 
-    # ✅ Direct mapping checks (no resolve)
-    required = [date_field, visit_id_field, invoice_id_field, customer_id_field]
-    missing = [f for f in required if not _field_exists(mappings, f)]
+    missing: List[str] = []
+    if not _field_exists(idx_mappings, date_field):
+        missing.append(date_field)
+    if not _field_exists(idx_mappings, visit_id_field):
+        missing.append(visit_id_field)
+    if not _field_exists(idx_mappings, invoice_id_field):
+        missing.append(invoice_id_field)
+    if not _field_exists(idx_mappings, customer_id_field):
+        missing.append(customer_id_field)
+
     if missing:
         return _es_cannot_answer(
-            "Cannot compute Dropoff Visits because required invoices fields are missing: "
-            + ", ".join(missing),
+            "Cannot compute Dropoff Visits because required invoices fields are missing: " + ", ".join(missing),
             business_rules,
         )
 
-    # Default window = last DEFAULT_WINDOW_DAYS if user didn't pass start/end
-    filters, window_label = _date_filters_or_default(req, date_field)
+    reqw = _with_default_window(req, default_days=365)
+    filters = _build_date_range_filter(reqw, date_field) or []
+    window_label = _window_label(reqw, default_days=365)
 
-    # Basic safety: only count docs that have needed fields
     filters.append({"exists": {"field": date_field}})
     filters.append({"exists": {"field": visit_id_field}})
 
@@ -359,15 +346,7 @@ def _es_dropoff_visits(
         "size": 0,
         "query": {"bool": {"filter": filters}},
         "aggs": {
-            # ✅ Main metric: distinct visits (approximate, very fast)
-            "dropoff_visits": {
-                "cardinality": {
-                    "field": visit_id_field,
-                    # optional: you can omit this completely for default behavior
-                    # "precision_threshold": 40000,
-                }
-            },
-            # Extra context
+            "dropoff_visits": {"cardinality": {"field": visit_id_field}},
             "invoice_count": {"value_count": {"field": invoice_id_field}},
             "unique_customers": {"cardinality": {"field": customer_id_field}},
         },
@@ -405,6 +384,7 @@ def _es_dropoff_visits(
         "rules_used": business_rules or "",
         "engine": "es",
     }
+
 
 __all__ = [
     "_es_month_over_month_visits",

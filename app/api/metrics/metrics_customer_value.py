@@ -1,63 +1,69 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from abi.runtime import to_json_safe
-from routes.es_test import _extract_properties_from_mapping
 
 from app.api.docs_analytics_routes import (
     _build_date_range_filter,
     _es_cannot_answer,
-    _select_invoice_index_from_es_mapping,
 )
 from app.api.metrics.shared_utilities import (
     _field_exists,
     _safe_es_search,
+    _load_customers_ctx,         
+    _get_invoice_index_and_mappings,
 )
+
+# -------------------------------------------------------------------
+# ✅ Shared helper: invoice mapping / index selection (NO DUPLICATION)
+# -------------------------------------------------------------------
+
+
+def _load_invoice_index_mappings(
+    req,
+    client,
+    mappings: Optional[Dict[str, Any]],
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (invoice_index_name, invoice_mappings).
+
+    ✅ Reuses provided invoice mappings (dashboard path) and avoids refetching.
+    ✅ Otherwise resolves the concrete invoices index (alias/wildcard-safe) and fetches once.
+    """
+    index_name = (getattr(req, "es_index_name", None) or "").strip()
+    if not index_name:
+        raise ValueError("No es_index_name provided for invoice metrics.")
+
+    invoice_index, invoice_mappings = _get_invoice_index_and_mappings(
+        client,
+        index_name,
+        existing_mappings=mappings,
+        existing_index=index_name,
+    )
+    return invoice_index, invoice_mappings
+
 
 # -------------------------------------------------------------------
 # Core visit metrics (lifetime) - customers rollup index
 # -------------------------------------------------------------------
 
+
 def _es_core_visit_metrics(
     req,
     client,
-    mappings: Dict[str, Any],  # ✅ added for compatibility with router (unused here)
+    mappings: Dict[str, Any],  # kept for router compatibility (not used)
     business_rules: Optional[str],
 ):
     """
     Core visit KPIs for the dashboard (LIFETIME / ALL HISTORY)
     ✅ Customers index ONLY (fast)
     """
-    cust_index = (getattr(req, "es_customers_index_name", None) or "").strip()
-    if not cust_index:
-        return _es_cannot_answer(
-            "Cannot compute core lifetime metrics: es_customers_index_name is not configured on the request.",
-            business_rules,
-        )
+    customers_index, cust_mappings, err = _load_customers_ctx(req, client, business_rules)
+    if err:
+        return err
 
-    # fetch customers mappings
-    try:
-        full_mapping = client.indices.get_mapping(index=cust_index)
-    except Exception as e:
-        return _es_cannot_answer(
-            f"Cannot compute core lifetime metrics: failed to fetch mappings for customers index '{cust_index}': {e}",
-            business_rules,
-        )
-
-    index_names = sorted(full_mapping.keys())
-    if not index_names:
-        return _es_cannot_answer(
-            f"Cannot compute core lifetime metrics: no indices found for pattern '{cust_index}'.",
-            business_rules,
-        )
-
-    chosen = index_names[0]
-    cust_props = ((full_mapping[chosen].get("mappings") or {}).get("properties")) or {}
-    cust_mappings = {"properties": cust_props}
-
-    # required rollup fields in your customers mapping
     required = ["customer_id", "visits_lifetime", "sales_pickup_lifetime"]
     missing = [f for f in required if not _field_exists(cust_mappings, f)]
     if missing:
@@ -71,6 +77,7 @@ def _es_core_visit_metrics(
     body: Dict[str, Any] = {
         "size": 0,
         "aggs": {
+            # NOTE: value_count assumes 1 doc per customer_id in this rollup index.
             "unique_customers": {"value_count": {"field": "customer_id"}},
             "total_visits": {"sum": {"field": "visits_lifetime"}},
             "total_visit_amount": {"sum": {"field": "sales_pickup_lifetime"}},
@@ -78,15 +85,14 @@ def _es_core_visit_metrics(
     }
 
     try:
-        res = _safe_es_search(client, index=chosen, body=body)
+        res = _safe_es_search(client, index=customers_index, body=body)
     except Exception as e:
         return _es_cannot_answer(
-            f"Error executing customers-index aggregation on '{chosen}': {e}",
+            f"Error executing customers-index aggregation on '{customers_index}': {e}",
             business_rules,
         )
 
     agg = (res.get("aggregations") or {})
-
     unique_customers = int((agg.get("unique_customers") or {}).get("value") or 0)
     total_visits = float((agg.get("total_visits") or {}).get("value") or 0.0)
     total_visit_amount = float((agg.get("total_visit_amount") or {}).get("value") or 0.0)
@@ -98,7 +104,7 @@ def _es_core_visit_metrics(
     ]
 
     insight = (
-        f"Core lifetime metrics were computed from customers rollups on index '{chosen}' "
+        f"Core lifetime metrics were computed from customers rollups on index '{customers_index}' "
         f"using sum(visits_lifetime) and sum(sales_pickup_lifetime)."
     )
 
@@ -117,36 +123,34 @@ def _es_core_visit_metrics(
 def _es_customer_value_metrics(
     req,
     client,
-    mappings: Dict[str, Any],  # ✅ added for compatibility (unused here)
+    mappings: Dict[str, Any],  # ✅ reused (dashboard passes invoice mappings)
     business_rules: Optional[str],
 ):
     """
     Windowed customer value metrics for the selected period (invoices index).
 
-    ✅ Uses direct mapping fields (no resolve_es_field):
-      - customer_id, dropoff_at, total, pieces, visit_id
+    ✅ Requires visit_id to compute total_visits (NO fallback).
     """
-    invoice_index, invoice_mapping = _select_invoice_index_from_es_mapping(client, req.es_index_name)
-    index_name = invoice_index
-
-    properties = _extract_properties_from_mapping(invoice_mapping, invoice_index)
-    invoice_mappings = {"properties": properties}
+    try:
+        index_name, invoice_mappings = _load_invoice_index_mappings(req, client, mappings)
+    except Exception as e:
+        return _es_cannot_answer(str(e), business_rules)
 
     customer_field = "customer_id"
     date_field = "dropoff_at"
     amount_field = "total"
+    visit_field = "visit_id"
 
     pieces_field = "pieces" if _field_exists(invoice_mappings, "pieces") else None
-    visit_field = "visit_id" if _field_exists(invoice_mappings, "visit_id") else None
 
-    if not (
-        _field_exists(invoice_mappings, customer_field)
-        and _field_exists(invoice_mappings, date_field)
-        and _field_exists(invoice_mappings, amount_field)
-    ):
+    # ✅ Require visit_id now (no fallback)
+    required = [customer_field, date_field, amount_field, visit_field]
+    missing = [f for f in required if not _field_exists(invoice_mappings, f)]
+    if missing:
         return _es_cannot_answer(
-            "Cannot compute customer value metrics because one of the required fields "
-            "is missing from the invoices index mapping: customer_id, dropoff_at, total.",
+            "Cannot compute customer value metrics because required fields are missing "
+            f"from the invoices index mapping: {', '.join(missing)}. "
+            "Expected fields: customer_id, dropoff_at, total, visit_id.",
             business_rules,
         )
 
@@ -155,15 +159,11 @@ def _es_customer_value_metrics(
     aggs: Dict[str, Any] = {
         "unique_customers": {"cardinality": {"field": customer_field}},
         "total_revenue": {"sum": {"field": amount_field}},
+        "total_visits": {"cardinality": {"field": visit_field}},  # ✅ NO fallback
     }
 
     if pieces_field:
         aggs["total_pieces"] = {"sum": {"field": pieces_field}}
-
-    if visit_field:
-        aggs["total_visits"] = {"cardinality": {"field": visit_field}}
-    else:
-        aggs["total_visits"] = {"value_count": {"field": date_field}}
 
     body: Dict[str, Any] = {"size": 0, "aggs": aggs}
     if filters:
@@ -181,8 +181,9 @@ def _es_customer_value_metrics(
 
     unique_customers = int((agg.get("unique_customers") or {}).get("value") or 0)
     total_revenue = float((agg.get("total_revenue") or {}).get("value") or 0.0)
-
-    total_pieces = float((agg.get("total_pieces") or {}).get("value") or 0.0) if "total_pieces" in agg else 0.0
+    total_pieces = (
+        float((agg.get("total_pieces") or {}).get("value") or 0.0) if "total_pieces" in agg else 0.0
+    )
     total_visits = int((agg.get("total_visits") or {}).get("value") or 0)
 
     if unique_customers > 0:
@@ -221,7 +222,7 @@ def _es_customer_value_metrics(
         f"Customer value metrics were computed on index '{index_name}' {window_str}, "
         f"using '{date_field}' as the visit date, '{customer_field}' as the customer id, "
         f"and '{amount_field}' as the invoice total. A visit is treated as a distinct "
-        f"visit_id when available, otherwise invoice rows are used as a proxy."
+        f"'{visit_field}'."
     )
 
     return {
@@ -231,41 +232,21 @@ def _es_customer_value_metrics(
         "engine": "es",
     }
 
-
 def _es_one_time_vs_repeat(
     req,
     client,
-    mappings: Dict[str, Any],  # ✅ added for compatibility (unused here)
+    mappings: Dict[str, Any],  # kept for compatibility (unused)
     business_rules: Optional[str],
 ):
-    cust_index = (getattr(req, "es_customers_index_name", None) or "").strip()
-    if not cust_index:
-        return _es_cannot_answer(
-            "Cannot compute one-time vs repeat: es_customers_index_name is not configured.",
-            business_rules,
-        )
+    """
+    One-time vs repeat computed from customers rollups.
+    """
+    customers_index, cust_mappings, err = _load_customers_ctx(req, client, business_rules)
+    if err:
+        return err
 
     basis = (getattr(req, "repeat_basis", None) or "lifetime").lower()
     visits_field = "visits_365" if basis in ("365", "1y", "year", "visits_365") else "visits_lifetime"
-
-    try:
-        full_mapping = client.indices.get_mapping(index=cust_index)
-    except Exception as e:
-        return _es_cannot_answer(
-            f"Cannot compute one-time vs repeat: failed to fetch mappings for '{cust_index}': {e}",
-            business_rules,
-        )
-
-    index_names = sorted(full_mapping.keys())
-    if not index_names:
-        return _es_cannot_answer(
-            f"Cannot compute one-time vs repeat: no indices found for pattern '{cust_index}'.",
-            business_rules,
-        )
-
-    chosen = index_names[0]
-    cust_props = ((full_mapping[chosen].get("mappings") or {}).get("properties")) or {}
-    cust_mappings = {"properties": cust_props}
 
     if not _field_exists(cust_mappings, visits_field):
         return _es_cannot_answer(
@@ -298,10 +279,10 @@ def _es_one_time_vs_repeat(
         body["query"] = {"bool": {"filter": filters}}
 
     try:
-        res = _safe_es_search(client, index=chosen, body=body)
+        res = _safe_es_search(client, index=customers_index, body=body)
     except Exception as e:
         return _es_cannot_answer(
-            f"Error executing customers-index aggregation on '{chosen}': {e}",
+            f"Error executing customers-index aggregation on '{customers_index}': {e}",
             business_rules,
         )
 
@@ -329,7 +310,7 @@ def _es_one_time_vs_repeat(
     ]
 
     insight = (
-        f"One-time vs repeat was computed from customers rollups on '{chosen}' "
+        f"One-time vs repeat was computed from customers rollups on '{customers_index}' "
         f"using '{visits_field}'. Out of {total} customers with >=1 visit, "
         f"{one_pct:.1f}% are one-time and {rep_pct:.1f}% are repeat."
     )
@@ -341,6 +322,79 @@ def _es_one_time_vs_repeat(
         "engine": "es",
     }
 
+
+def _es_new_customers_first_visit_in_period_value_count(
+    req,
+    client,
+    mappings: Dict[str, Any],  # unused (kept for signature compatibility)
+    business_rules: Optional[str],
+):
+    """
+    KPI: New Customers (First Visit in Window)
+    Definition: count customer docs whose customers.first_visit is within [start_date, end_date].
+    Uses value_count(customer_id) assuming 1 doc per customer.
+    """
+    customers_index, cust_mappings, err = _load_customers_ctx(req, client, business_rules)
+    if err:
+        return err
+
+    # Use first_visit (your mapping has it)
+    if not _field_exists(cust_mappings, "first_visit"):
+        return _es_cannot_answer(
+            "Cannot compute New Customers (first visit in window): customers.first_visit is missing.",
+            business_rules,
+        )
+
+    date_field = "first_visit"
+
+    # Dashboard must provide a window
+    if not getattr(req, "start_date", None) and not getattr(req, "end_date", None):
+        return _es_cannot_answer(
+            "New Customers (first visit) requires start_date/end_date on the request.",
+            business_rules,
+        )
+
+    filters: List[Dict[str, Any]] = []
+    filters.extend(_build_date_range_filter(req, date_field))
+    filters.append({"exists": {"field": date_field}})
+    filters.append({"exists": {"field": "customer_id"}})
+
+    # Optional company filter (only if you pass it)
+    company_id = getattr(req, "company_id", None)
+    if company_id is not None:
+        try:
+            filters.append({"term": {"company_id": int(company_id)}})
+        except Exception:
+            pass
+
+    body: Dict[str, Any] = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "new_customers": {"value_count": {"field": "customer_id"}}
+        },
+    }
+
+    try:
+        res = _safe_es_search(client, index=customers_index, body=body)
+    except Exception as e:
+        return _es_cannot_answer(
+            f"Error executing customers-index aggregation on '{customers_index}': {e}",
+            business_rules,
+        )
+
+    agg = (res.get("aggregations") or {})
+    new_customers = int((agg.get("new_customers") or {}).get("value") or 0)
+
+    return {
+        "insight": to_json_safe(
+            f"New Customers computed from '{customers_index}' as value_count(customer_id) "
+            f"filtered by customers.{date_field} within the dashboard window."
+        ),
+        "rows": to_json_safe({"count": new_customers}),
+        "rules_used": business_rules or "",
+        "engine": "es",
+    }
 
 def _window_customer_value_metrics(
     req,
@@ -379,4 +433,5 @@ __all__ = [
     "_es_customer_value_metrics",
     "_es_one_time_vs_repeat",
     "_window_customer_value_metrics",
+    "_es_new_customers_first_visit_in_period_value_count",
 ]
